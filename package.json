@@ -1,0 +1,30 @@
+{
+  "name": "raven-oracle-offchain",
+  "version": "1.0.0",
+  "description": "Off-chain Raven Oracle for credit calculations and batch processing",
+  "main": "ravenOracle.js",
+  "scripts": {
+    "start": "node ravenOracle.js",
+    "dev": "ts-node ravenOracle.ts",
+    "build": "tsc ravenOracle.ts",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "ethers": "^6.8.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.8.0",
+    "typescript": "^5.2.2",
+    "ts-node": "^10.9.1"
+  },
+  "keywords": [
+    "blockchain",
+    "ethereum",
+    "oracle",
+    "credits",
+    "raven"
+  ],
+  "author": "Raven Team",
+  "license": "MIT"
+}
