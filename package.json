@@ -1,30 +1,41 @@
 {
-  "name": "raven-oracle-offchain",
+  "name": "agent-asva-solidity",
   "version": "1.0.0",
-  "description": "Off-chain Raven Oracle for credit calculations and batch processing",
-  "main": "ravenOracle.js",
+  "description": "Raven Subscription & Treasury Smart Contracts",
   "scripts": {
-    "start": "node ravenOracle.js",
-    "dev": "ts-node ravenOracle.ts",
-    "build": "tsc ravenOracle.ts",
-    "test": "node test.js"
-  },
-  "dependencies": {
-    "ethers": "^6.8.0",
-    "dotenv": "^16.3.1"
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "coverage": "hardhat coverage",
+    "deploy:mocks:sepolia": "hardhat run scripts/deployMocks.ts --network sepolia",
+    "deploy:sepolia": "hardhat run scripts/deploySubcribe.ts --network sepolia && hardhat run scripts/deployTreasury.ts --network sepolia",
+    "deploy:base": "hardhat run scripts/deploySubcribe.ts --network base && hardhat run scripts/deployTreasury.ts --network base",
+    "node": "hardhat node",
+    "clean": "hardhat clean"
   },
   "devDependencies": {
-    "@types/node": "^20.8.0",
-    "typescript": "^5.2.2",
-    "ts-node": "^10.9.1"
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.8",
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/contracts": "^5.4.0",
+    "@types/chai": "^4.3.10",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^22.7.5",
+    "chai": "^4.4.1",
+    "dotenv": "^17.2.2",
+    "ethers": "^6.13.4",
+    "hardhat": "^2.22.17",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.8.3"
   },
   "keywords": [
     "blockchain",
     "ethereum",
-    "oracle",
-    "credits",
-    "raven"
+    "solidity",
+    "subscription",
+    "treasury",
+    "multi-sig",
+    "hardhat"
   ],
-  "author": "Raven Team",
+  "author": "Pavan ASVA",
   "license": "MIT"
 }
