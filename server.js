@@ -11,6 +11,18 @@ const PORT = process.env.PORT || 8080;
 const RPC_URL = process.env.RPC_URL || 'https://sepolia.infura.io/v3/YOUR_INFURA_KEY';
 const RAVEN_ACCESS_ADDRESS = process.env.RAVEN_ACCESS_ADDRESS || '0x0000000000000000000000000000000000000000';
 
+// Helper: JSON-safe serializer for BigInt
+function serialize(value) {
+  if (typeof value === 'bigint') return value.toString();
+  if (Array.isArray(value)) return value.map(serialize);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = serialize(v);
+    return out;
+  }
+  return value;
+}
+
 // Lazy provider/oracle to avoid crashing when env is missing
 let _provider = null;
 let _oracle = null;
@@ -146,7 +158,7 @@ app.get('/users/:address/subscription', async (req, res) => {
     const addr = req.params.address;
     if (!ethers.isAddress(addr)) return res.status(400).json({ error: 'invalid address' });
     const sub = await getOracle().getUserSubscription(addr);
-    return res.json(sub || {});
+    return res.json(serialize(sub || {}));
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
