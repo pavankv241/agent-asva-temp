@@ -11,6 +11,17 @@ class RavenOracle {
         this.SOCIAL_QUEST_CREDIT_AMOUNT = 2;
         this.MAX_SOCIAL_QUESTS_PER_USER = 5;
 
+        // Off-chain engagement actions and fixed credit rewards
+        this.ACTION_CREDITS = {
+            new_user_bonus: 50,           // 50 credits
+            referral_you_refer: 15,       // 15 credits
+            referral_you_are_referred: 5, // 5 credits
+            like: 2,                      // 2 credits
+            comment: 3,                   // 3 credits
+            repost: 5,                    // 5 credits
+            yap: 6                        // 6 credits
+        };
+
         this.batchInterval = 60 * 60 * 1000; // 1 hour in milliseconds
         this.lastBatchTime = Date.now();
 
@@ -20,6 +31,10 @@ class RavenOracle {
             tags: 2,
             price_accuracy: 4,
             full: 6,
+            scores: {
+                logic: 2,
+                sentiment: 2
+            }
         };
 
         // Constraint constants
@@ -43,11 +58,55 @@ class RavenOracle {
         return receipt;
     }
 
+    // GetActionXP
+    getActionXP(action){
+        // XP is only for engagement actions, calculated as Credits * 2
+        const credits = this.getActionCredit(action);
+        return credits !== null ? credits * 2 : null;
+    }
+
+    // Note: XP is only for engagements actions , not for calculated credits
+    calculateXP(reason, parameter){
+        const normalizedReason = String(reason || '').toLowerCase();
+
+        // Check if it's an engagement action (has fixed credits)
+        const fixedCredit = this.getActionCredit(normalizedReason);
+        if (fixedCredit !== null) {
+            // Engagement Action: XP = Credits * 2
+            return fixedCredit * 2;
+        }
+
+        // For calculated credits (ai_inference, social_quest, etc.), NO XP
+        return 0;
+    }
+
+    async getUserXP(userAddress){
+        try{
+            const xp = await this.ravenAccess.getUserXP(userAddress);
+            return xp.toString();
+        } catch (err){
+            console.error('Error Getting User XP', err);
+            return '0';
+        }
+    }
+
+
+
     // Compute credit cost for an inference request
     getInferenceCost(mode, quantity = 1) {
-        const m = String(mode);
-        const unit = this.COSTS[m];
-        if (!unit) throw new Error('Unknown mode');
+        const path = String(mode).split('.').filter(Boolean);
+        if (!path.length) throw new Error('mode required');
+
+        let unit;
+        if (path.length === 1) {
+            unit = this.COSTS[path[0]];
+        } else if (path.length === 2 && path[0] === 'scores') {
+            unit = this.COSTS.scores?.[path[1]];
+        } else {
+            throw new Error(`Unknown mode: ${mode}`);
+        }
+
+        if (!Number.isFinite(unit)) throw new Error(`Unknown mode: ${mode}`);
         if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('quantity must be > 0');
         return unit * quantity;
     }
@@ -198,19 +257,35 @@ class RavenOracle {
         return subscription.usedThisWindow >= subscription.plan.monthlyCap;
     }
 
+    getActionCredit(action) {
+        if (!action) return null;
+        const key = String(action).toLowerCase();
+        const value = this.ACTION_CREDITS[key];
+        return typeof value === 'number' ? value : null;
+    }
+
     // Calculate credits based on reason and parameter
     calculateCredits(reason, parameter) {
-        switch (reason) {
+        const normalizedReason = String(reason || '').toLowerCase();
+
+        // Fixed-credit actions table (from growth/engagement sheet), supports dotted paths
+        const fixedCredit = this.getActionCredit(normalizedReason);
+        if (fixedCredit !== null) {
+            return fixedCredit;
+        }
+
+        switch (normalizedReason) {
             case 'ai_inference':
             case 'prompt_streak':
                 return Math.floor(parameter / this.AI_INFERENCE_PROMPTS_PER_CREDIT);
             case 'referral':
                 return parameter * this.REFERRAL_CREDIT_AMOUNT;
-            case 'social_quest':
+            case 'social_quest': {
                 const questCount = Math.min(parameter, this.MAX_SOCIAL_QUESTS_PER_USER);
                 return questCount * this.SOCIAL_QUEST_CREDIT_AMOUNT;
+            }
             default:
-                return parameter; // Custom reasons
+                return parameter; // Custom reasons (fallback)
         }
     }
 
@@ -230,6 +305,51 @@ class RavenOracle {
 
 
 
+    // Get remaining inference count for a user (calculated off-chain with window reset logic)
+    async getRemainingInference(userAddress, mode) {
+        try {
+            const subscription = await this.getUserSubscription(userAddress);
+            
+            // No subscription = 0 remaining
+            if (!subscription || Number(subscription.planId) === 0) {
+                return '0';
+            }
+
+            // Apply window reset logic (30-day windows, matching contract logic)
+            let usedCount = Number(subscription.usedThisWindow);
+            if (subscription.startTimestamp && Number(subscription.startTimestamp) > 0) {
+                const DAYS_30_SECONDS = 30 * 24 * 60 * 60; // 2592000 seconds
+                const startTimestamp = Number(subscription.startTimestamp);
+                // Get current block timestamp (in seconds)
+                const currentBlock = await this.provider.getBlock('latest');
+                const currentTimestamp = currentBlock ? currentBlock.timestamp : Math.floor(Date.now() / 1000);
+                
+                // Match contract's _monthWindowStart logic: (timestamp / 30 days) * 30 days
+                const lastWindow = Math.floor(startTimestamp / DAYS_30_SECONDS) * DAYS_30_SECONDS;
+                const currentWindow = Math.floor(currentTimestamp / DAYS_30_SECONDS) * DAYS_30_SECONDS;
+                
+                if (currentWindow > lastWindow) {
+                    usedCount = 0; // Window reset
+                }
+            }
+
+            // Determine effective cap based on mode
+            const normalizedMode = String(mode || '').toLowerCase();
+            const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
+            const planCap = Number(subscription.plan.monthlyCap);
+            const effectiveCap = isPriceAccuracyMode ? this.GLOBAL_PRICE_ACCURACY_CAP : planCap;
+
+            // Calculate remaining (prevent negative)
+            if (usedCount >= effectiveCap) {
+                return '0';
+            }
+            return String(effectiveCap - usedCount);
+        } catch (error) {
+            console.error('Error getting remaining inference:', error);
+            return '0';
+        }
+    }
+
     getAccessABI() {
         return [
             "function subscriptions(address user) external view returns (uint8 planId, uint256 startTimestamp, uint256 usedThisWindow, uint256 lastRenewedAt)",
@@ -237,6 +357,8 @@ class RavenOracle {
             "function plans(uint8 planId) external view returns (uint256 priceUnits, uint256 monthlyCap, bool active)",
             "function credits(address user) external view returns (uint256)",
             "function getUserCredits(address user) external view returns (uint256)",
+            "function xp(address user) external view returns (uint256)",
+            "function getUserXP(address user) external view returns (uint256)",
             // Writes
             "function updateUserMemoryPointer(address user, string memoryHash) external",
             "function awardCredits(address user, uint256 amount, string reason) external",
@@ -250,7 +372,7 @@ async function main() {
     // Configuration (env overrides recommended for terminal usage)
     const RPC_URL = process.env.RPC_URL || 'https://sepolia.infura.io/v3/YOUR_INFURA_KEY';
     const RAVEN_ACCESS_ADDRESS = process.env.RAVEN_ACCESS_ADDRESS || '0x...';
-    const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
+    //const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 
     // Initialize oracle
     const provider = new ethers.JsonRpcProvider(RPC_URL);
@@ -259,12 +381,8 @@ async function main() {
         RAVEN_ACCESS_ADDRESS
     );
 
-    // Optional signer for write operations
+    // Signer intentionally not loaded from PRIVATE_KEY in this example.
     let signer = null;
-    if (PRIVATE_KEY) {
-        signer = new ethers.Wallet(PRIVATE_KEY, provider);
-        // console.log('Signer loaded for writes:', await signer.getAddress());
-    }
 
     // Example: Check user subscription
     const userAddress = process.env.USER || '0x...';
