@@ -1160,27 +1160,45 @@ async function settleInferenceAuthorization({
 }
 
 // Authorization helper (reads on-chain state)
-// body: { user: string, mode: string, quantity?: number, settle?: boolean, contextHash?: string, reason?: string }
+// body: { user: string, mode?: string, quantity?: number, settle?: boolean, contextHash?: string, reason?: string }
 app.post('/inference/authorize', async (req, res) => {
   try {
     const { user, mode, quantity = 1, settle = false, contextHash = '', reason } = req.body || {};
     const checksumUser = normalizeHexAddress(user);
     if (!checksumUser) return res.status(400).json({ error: 'valid user address required' });
-    if (typeof mode !== 'string' || mode.length === 0) return res.status(400).json({ error: 'mode required' });
     const numericQuantity = Number(quantity);
     if (!Number.isFinite(numericQuantity) || numericQuantity <= 0) {
       return res.status(400).json({ error: 'quantity must be > 0' });
     }
     const contextHashValue = typeof contextHash === 'string' ? contextHash : '';
     const reasonValue = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
+    let resolvedMode = (typeof mode === 'string' && mode.length > 0) ? mode : null;
 
-    const result = await getOracle().authorizeInference(user, mode, numericQuantity);
+    // If mode not provided, infer from active subscription plan:
+    // Plan 1 -> basic, Plan 2 -> tags, Plan 3 -> full
+    let subscriptionForInference = null;
+    if (!resolvedMode) {
+      subscriptionForInference = await getOracle().getUserSubscription(checksumUser);
+      const planId = subscriptionForInference ? Number(subscriptionForInference.planId ?? subscriptionForInference[0] ?? 0) : 0;
+      const hasActiveSub = !!subscriptionForInference && planId > 0 && subscriptionForInference.plan?.active;
+      if (hasActiveSub) {
+        if (planId === 1) resolvedMode = 'basic';
+        else if (planId === 2) resolvedMode = 'tags';
+        else if (planId === 3) resolvedMode = 'full';
+      }
+    }
+
+    if (!resolvedMode) {
+      return res.status(400).json({ error: 'mode required or cannot infer from subscription plan' });
+    }
+
+    const result = await getOracle().authorizeInference(user, resolvedMode, numericQuantity);
     let settlement = { attempted: false, status: 'skipped' };
 
     if (result?.allowed && result.method === 'subscription') {
       await cacheAuthorizationUsage({
         user: checksumUser,
-        mode,
+        mode: resolvedMode,
         quantity: numericQuantity,
         method: result.method,
         contextHash: contextHashValue,
@@ -1195,7 +1213,7 @@ app.post('/inference/authorize', async (req, res) => {
     ) {
       settlement = await settleInferenceAuthorization({
         user: checksumUser,
-        mode,
+        mode: resolvedMode,
         quantity: numericQuantity,
         method: result.method,
         cost: result.cost,
@@ -1206,6 +1224,7 @@ app.post('/inference/authorize', async (req, res) => {
 
     return res.json(serialize({
       ...result,
+      mode: resolvedMode,
       contextHash: contextHashValue,
       settlement
     }));
