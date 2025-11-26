@@ -892,7 +892,6 @@ app.get('/', (_req, res) => {
       'GET /users/:address/credits/pending',
       'GET /users/:address/credits/calculated',
       'GET /users/:address/subscription',
-      'GET /users/:address/inference/remaining?mode=<mode>',
       'GET /users/:address/has-active-subscription',
       'POST /memory/update',
       'POST /credits/initial-grant',
@@ -1382,90 +1381,6 @@ app.get('/users/:address/subscription', async (req, res) => {
     if (!checksumAddr) return res.status(400).json({ error: 'invalid address' });
     const sub = await getOracle().getUserSubscription(checksumAddr);
     return res.json(serialize(sub || {}));
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-// Get remaining inference count for a user
-// Query param: mode (required) - "basic", "tags", "price_accuracy", or "full"
-app.get('/users/:address/inference/remaining', async (req, res) => {
-  try {
-    const addr = req.params.address;
-    let mode = req.query.mode;
-    const checksumAddr = normalizeHexAddress(addr);
-    if (!checksumAddr) return res.status(400).json({ error: 'invalid address' });
-    const normalizedAddress = normalizeAddress(checksumAddr);
-    let normalizedMode = typeof mode === 'string' ? mode.toLowerCase() : '';
-
-    // Fetch subscription to infer default mode when none provided
-    const subscription = await getOracle().getUserSubscription(checksumAddr);
-    const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
-    if (!mode || typeof mode !== 'string') {
-      // Derive default mode per plan: 1->basic, 2->tags, 3->full
-      if (planId === 1) mode = 'basic';
-      else if (planId === 2) mode = 'tags';
-      else if (planId === 3) mode = 'full';
-      else {
-        return res.json(serialize({
-          address: checksumAddr,
-          mode: null,
-          remaining: '0',
-          source: 'onchain',
-          reason: 'no_subscription_or_mode'
-        }));
-      }
-      normalizedMode = mode.toLowerCase();
-    }
-
-    // Ensure the user's plan allows this mode before reporting remaining
-    if (planId > 0 && subscription?.plan?.active) {
-      if (!isModeAllowedForPlan(planId, normalizedMode)) {
-        return res.json(serialize({
-          address: checksumAddr,
-          mode,
-          remaining: '0',
-          source: 'neo4j',
-          reason: 'mode_not_in_plan'
-        }));
-      }
-    } else if (planId === 0) {
-      // No subscription: rely on credits (but remaining query is subscription-based)
-      // Continue to cached/on-chain path which will likely return 0.
-    }
-
-    const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
-    if (stored && stored.remaining !== undefined && stored.remaining !== null && Number(stored.remaining) > 0) {
-      return res.json(serialize({
-        address: checksumAddr,
-        mode,
-        remaining: stored.remaining,
-        source: stored.source || 'neo4j',
-        updatedAt: stored.updatedAt || Date.now()
-      }));
-    }
-
-    const remaining = await getOracle().getRemainingInference(checksumAddr, mode);
-    // If we have an active subscription and non-zero remaining on-chain after a renewal,
-    // refresh the Neo4j cache so future reads pick up the new window.
-    if (planId > 0 && subscription?.plan?.active && Number(remaining) > 0) {
-      try {
-        await recordInferenceUsageSnapshot({
-          user: checksumAddr,
-          mode,
-          method: 'subscription',
-          quantity: 0,
-          cost: 0,
-          contextHash: '',
-          reason: 'window_refresh',
-          remainingOverride: Number(remaining)
-        });
-      } catch (err) {
-        console.error('[inference/remaining] failed to refresh cache after renewal', err);
-      }
-    }
-
-    return res.json(serialize({ address: checksumAddr, mode, remaining, source: 'onchain' }));
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
