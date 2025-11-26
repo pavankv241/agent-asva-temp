@@ -1374,7 +1374,7 @@ app.get('/users/:address/inference/remaining', async (req, res) => {
 
     // Ensure the user's plan allows this mode before reporting remaining
     const subscription = await getOracle().getUserSubscription(checksumAddr);
-    const planId = subscription?.planId ?? subscription?.planId === 0 ? Number(subscription.planId) : Number(subscription?.planId || 0);
+    const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
     if (planId > 0 && subscription?.plan?.active) {
       if (!isModeAllowedForPlan(planId, normalizedMode)) {
         return res.json(serialize({
@@ -1391,7 +1391,7 @@ app.get('/users/:address/inference/remaining', async (req, res) => {
     }
 
     const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
-    if (stored && stored.remaining !== undefined && stored.remaining !== null) {
+    if (stored && stored.remaining !== undefined && stored.remaining !== null && Number(stored.remaining) > 0) {
       return res.json(serialize({
         address: checksumAddr,
         mode,
@@ -1402,6 +1402,25 @@ app.get('/users/:address/inference/remaining', async (req, res) => {
     }
 
     const remaining = await getOracle().getRemainingInference(checksumAddr, mode);
+    // If we have an active subscription and non-zero remaining on-chain after a renewal,
+    // refresh the Neo4j cache so future reads pick up the new window.
+    if (planId > 0 && subscription?.plan?.active && Number(remaining) > 0) {
+      try {
+        await recordInferenceUsageSnapshot({
+          user: checksumAddr,
+          mode,
+          method: 'subscription',
+          quantity: 0,
+          cost: 0,
+          contextHash: '',
+          reason: 'window_refresh',
+          remainingOverride: Number(remaining)
+        });
+      } catch (err) {
+        console.error('[inference/remaining] failed to refresh cache after renewal', err);
+      }
+    }
+
     return res.json(serialize({ address: checksumAddr, mode, remaining, source: 'onchain' }));
   } catch (e) {
     return res.status(500).json({ error: e.message });
