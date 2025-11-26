@@ -1049,22 +1049,34 @@ async function cacheAuthorizationUsage({
   try {
     const normalizedAddress = normalizeAddress(user);
     const normalizedMode = String(mode || '').toLowerCase();
+    
+    // Get current subscription first to check planId
+    const subscription = await getOracle().getUserSubscription(user);
+    const currentPlanId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
+    
     const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
     let baseline = null;
-    if (stored && stored.remaining !== undefined && stored.remaining !== null) {
+    
+    // Only use cached value if planId matches current planId
+    const cachedPlanId = stored?.planId;
+    const planMatches = cachedPlanId !== null && cachedPlanId === currentPlanId;
+    
+    if (stored && stored.remaining !== undefined && stored.remaining !== null && planMatches) {
+      // Use cached value only if plan hasn't changed
       baseline = Number(stored.remaining);
     } else {
+      // Fetch fresh from on-chain (cache miss or plan changed)
       const onchainRemaining = await getOracle().getRemainingInference(user, mode);
       baseline = Number(onchainRemaining);
     }
+    
     if (!Number.isFinite(baseline)) return;
     const nextRemaining = Math.max(baseline - Number(quantity || 0), 0);
+    
     // Keep all allowed modes in sync for this plan so remaining is a single shared pool
-    const subscription = await getOracle().getUserSubscription(user);
-    const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
     const candidateModes = ['basic', 'tags', 'price_accuracy', 'full'];
     for (const m of candidateModes) {
-      if (!isModeAllowedForPlan(planId, m)) continue;
+      if (!isModeAllowedForPlan(currentPlanId, m)) continue;
       await recordInferenceUsageSnapshot({
         user,
         mode: m,
