@@ -164,7 +164,8 @@ class RavenOracle {
 
             const monthlyCap = Number(subscription.plan.monthlyCap);
             const used = Number(subscription.usedThisWindow);
-            const effectiveCap = isPriceAccuracyMode ? this.GLOBAL_PRICE_ACCURACY_CAP : monthlyCap;
+            // Use per-plan monthlyCap for all modes (Plan1=3000, Plan2=4000, Plan3=5000)
+            const effectiveCap = monthlyCap;
             if (used + quantity <= effectiveCap) {
                 return { allowed: true, method: 'subscription', reason: 'within_subscription_cap', cost: 0 };
             }
@@ -347,11 +348,10 @@ class RavenOracle {
                 }
             }
 
-            // Determine effective cap based on mode
+            // Determine effective cap based on plan (Plan1=3000, Plan2=4000, Plan3=5000)
             const normalizedMode = String(mode || '').toLowerCase();
-            const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
             const planCap = Number(subscription.plan.monthlyCap);
-            const effectiveCap = isPriceAccuracyMode ? this.GLOBAL_PRICE_ACCURACY_CAP : planCap;
+            const effectiveCap = planCap;
 
             // Calculate remaining (prevent negative)
             if (usedCount >= effectiveCap) {
