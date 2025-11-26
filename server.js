@@ -1375,16 +1375,33 @@ app.get('/users/:address/subscription', async (req, res) => {
 app.get('/users/:address/inference/remaining', async (req, res) => {
   try {
     const addr = req.params.address;
-    const mode = req.query.mode;
+    let mode = req.query.mode;
     const checksumAddr = normalizeHexAddress(addr);
     if (!checksumAddr) return res.status(400).json({ error: 'invalid address' });
-    if (!mode || typeof mode !== 'string') return res.status(400).json({ error: 'mode query parameter required (basic, tags, price_accuracy, or full)' });
     const normalizedAddress = normalizeAddress(checksumAddr);
-    const normalizedMode = mode.toLowerCase();
+    let normalizedMode = typeof mode === 'string' ? mode.toLowerCase() : '';
 
-    // Ensure the user's plan allows this mode before reporting remaining
+    // Fetch subscription to infer default mode when none provided
     const subscription = await getOracle().getUserSubscription(checksumAddr);
     const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
+    if (!mode || typeof mode !== 'string') {
+      // Derive default mode per plan: 1->basic, 2->tags, 3->full
+      if (planId === 1) mode = 'basic';
+      else if (planId === 2) mode = 'tags';
+      else if (planId === 3) mode = 'full';
+      else {
+        return res.json(serialize({
+          address: checksumAddr,
+          mode: null,
+          remaining: '0',
+          source: 'onchain',
+          reason: 'no_subscription_or_mode'
+        }));
+      }
+      normalizedMode = mode.toLowerCase();
+    }
+
+    // Ensure the user's plan allows this mode before reporting remaining
     if (planId > 0 && subscription?.plan?.active) {
       if (!isModeAllowedForPlan(planId, normalizedMode)) {
         return res.json(serialize({
