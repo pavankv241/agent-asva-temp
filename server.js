@@ -1504,9 +1504,23 @@ app.get('/users/:address/summary', async (req, res) => {
     } else if (!isModeAllowedForPlan(planId, inferredMode)) {
       inference.reason = 'mode_not_in_plan';
     } else {
-      // Use the oracle helper for remaining; on-chain is source of truth
-      const remaining = await getOracle().getRemainingInference(checksumAddr, inferredMode);
-      inference.remaining = String(remaining);
+      const normalizedAddress = normalizeAddress(checksumAddr);
+      const normalizedMode = inferredMode.toLowerCase();
+
+      // Prefer cached Neo4j remaining (kept in sync by authorizeInference)
+      const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
+      if (stored && stored.remaining !== undefined && stored.remaining !== null && Number(stored.remaining) >= 0) {
+        inference.remaining = String(stored.remaining);
+        inference.source = stored.source || 'neo4j';
+        if (stored.updatedAt) {
+          inference.updatedAt = stored.updatedAt;
+        }
+      } else {
+        // Fallback to on-chain helper
+        const remaining = await getOracle().getRemainingInference(checksumAddr, inferredMode);
+        inference.remaining = String(remaining);
+        inference.source = 'onchain';
+      }
     }
 
     return res.json(serialize({
