@@ -263,6 +263,141 @@ class MemoryEngagementStore {
   }
 }
 
+class MemoryInferenceUsageStore {
+  constructor() {
+    this.source = 'memory';
+    this.records = new Map();
+  }
+
+  _key(address, mode) {
+    return `${address.toLowerCase()}::${mode.toLowerCase()}`;
+  }
+
+  async recordUsage(snapshot) {
+    const key = this._key(snapshot.address, snapshot.mode);
+    const entry = {
+      ...snapshot,
+      updatedAt: snapshot.updatedAt ?? Date.now()
+    };
+    this.records.set(key, entry);
+    return entry;
+  }
+
+  async getRemaining(address, mode) {
+    const entry = this.records.get(this._key(address, mode));
+    if (!entry || entry.remaining === undefined) return null;
+    return {
+      remaining: entry.remaining,
+      updatedAt: entry.updatedAt,
+      method: entry.method,
+      source: this.source
+    };
+  }
+}
+
+class Neo4jInferenceUsageStore {
+  constructor(driver) {
+    this.driver = driver;
+    this.source = 'neo4j';
+  }
+
+  async recordUsage(snapshot) {
+    const session = this.driver.session();
+    try {
+      const payload = {
+        address: snapshot.address,
+        mode: snapshot.mode,
+        remaining: snapshot.remaining ?? '0',
+        usedThisWindow: snapshot.usedThisWindow ?? 0,
+        planId: snapshot.planId ?? 0,
+        planMonthlyCap: snapshot.planMonthlyCap ?? 0,
+        method: snapshot.method ?? '',
+        quantity: snapshot.quantity ?? 0,
+        cost: snapshot.cost ?? '0',
+        contextHash: snapshot.contextHash ?? '',
+        reason: snapshot.reason ?? '',
+        txHash: snapshot.txHash ?? ''
+      };
+      const result = await session.executeWrite(tx =>
+        tx.run(
+          `
+          MERGE (u:User {address: $address})
+          MERGE (u)-[:HAS_INFERENCE_USAGE]->(usage:InferenceUsage {mode: $mode})
+          SET usage.remaining = $remaining,
+              usage.used = $usedThisWindow,
+              usage.planId = $planId,
+              usage.planMonthlyCap = $planMonthlyCap,
+              usage.method = $method,
+              usage.quantity = $quantity,
+              usage.cost = $cost,
+              usage.contextHash = $contextHash,
+              usage.reason = $reason,
+              usage.txHash = $txHash,
+              usage.updatedAtMs = timestamp()
+          RETURN usage.remaining AS remaining,
+                 usage.updatedAtMs AS updatedAtMs
+          `,
+          {
+            address: payload.address,
+            mode: payload.mode,
+            remaining: payload.remaining,
+            usedThisWindow: payload.usedThisWindow,
+            planId: payload.planId,
+            planMonthlyCap: payload.planMonthlyCap,
+            method: payload.method,
+            quantity: payload.quantity,
+            cost: payload.cost,
+            contextHash: payload.contextHash,
+            reason: payload.reason,
+            txHash: payload.txHash
+          }
+        )
+      );
+      const record = result.records[0];
+      return {
+        remaining: record?.get('remaining') ?? snapshot.remaining,
+        updatedAt: Number(record?.get('updatedAtMs') || Date.now()),
+        source: this.source
+      };
+    } catch (err) {
+      console.error('[Neo4jInferenceUsageStore] Error recording usage:', err.message);
+      return null;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async getRemaining(address, mode) {
+    const session = this.driver.session();
+    try {
+      const result = await session.executeRead(tx =>
+        tx.run(
+          `
+          MATCH (u:User {address: $address})-[:HAS_INFERENCE_USAGE]->(usage:InferenceUsage {mode: $mode})
+          RETURN usage.remaining AS remaining,
+                 usage.updatedAtMs AS updatedAtMs,
+                 usage.method AS method
+          `,
+          { address, mode }
+        )
+      );
+      if (!result.records.length) return null;
+      const record = result.records[0];
+      return {
+        remaining: record.get('remaining'),
+        updatedAt: Number(record.get('updatedAtMs') || 0),
+        method: record.get('method'),
+        source: this.source
+      };
+    } catch (err) {
+      console.error('[Neo4jInferenceUsageStore] Error getting remaining:', err.message);
+      return null;
+    } finally {
+      await session.close();
+    }
+  }
+}
+
 class Neo4jEngagementStore {
   constructor(driver) {
     this.driver = driver;
@@ -589,6 +724,15 @@ const engagementStore = (() => {
   return new MemoryEngagementStore();
 })();
 
+const inferenceStore = (() => {
+  const driver = getNeo4jDriver();
+  if (driver) {
+    return new Neo4jInferenceUsageStore(driver);
+  }
+  console.warn('[inference-store] Neo4j not configured, using in-memory store (non-persistent)');
+  return new MemoryInferenceUsageStore();
+})();
+
 async function ClearPendingCredits(trigger = 'timer') {
   const [pendingEngagements, pendingCalculations] = await Promise.all([
     engagementStore.fetchPendingEngagements(),
@@ -804,6 +948,110 @@ app.post('/inference/estimate', (req, res) => {
   }
 });
 
+async function recordInferenceUsageSnapshot({
+  user,
+  mode,
+  method,
+  quantity,
+  cost,
+  contextHash,
+  reason,
+  txHash,
+  remainingOverride
+}) {
+  if (!inferenceStore) return null;
+  try {
+    const normalizedAddress = normalizeAddress(user);
+    const normalizedMode = String(mode || '').toLowerCase();
+    const payload = {
+      address: normalizedAddress,
+      mode: normalizedMode,
+      method,
+      quantity: Number(quantity) || 0,
+      cost: cost !== undefined && cost !== null ? String(cost) : '0',
+      contextHash: contextHash || '',
+      reason: reason || '',
+      txHash: txHash || ''
+    };
+
+    if (method === 'subscription') {
+      let remainingValue = remainingOverride;
+      let planMonthlyCap = undefined;
+      let planId = undefined;
+      let used = undefined;
+      if (remainingValue === undefined) {
+        const oracle = getOracle();
+        const subscription = await oracle.getUserSubscription(user);
+        if (!subscription || Number(subscription.planId) === 0) return null;
+        planMonthlyCap = Number(subscription.plan?.monthlyCap ?? 0);
+        planId = Number(subscription.planId);
+        used = Number(subscription.usedThisWindow ?? 0);
+        const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
+        const effectiveCap = isPriceAccuracyMode ? Number(oracle.GLOBAL_PRICE_ACCURACY_CAP) : planMonthlyCap;
+        remainingValue = Math.max(effectiveCap - used, 0);
+      }
+      payload.planMonthlyCap = planMonthlyCap;
+      payload.planId = planId;
+      payload.usedThisWindow = used;
+      payload.remaining = String(remainingValue ?? 0);
+    } else {
+      return null;
+    }
+
+    return await inferenceStore.recordUsage(payload);
+  } catch (err) {
+    console.error('[recordInferenceUsageSnapshot] error:', err.message || err);
+    return null;
+  }
+}
+
+async function getStoredRemainingInference(address, mode) {
+  if (!inferenceStore) return null;
+  try {
+    return await inferenceStore.getRemaining(address, mode.toLowerCase());
+  } catch (err) {
+    console.error('[inference-store] getRemaining error:', err.message || err);
+    return null;
+  }
+}
+
+async function cacheAuthorizationUsage({
+  user,
+  mode,
+  quantity,
+  method,
+  contextHash,
+  reason
+}) {
+  if (method !== 'subscription') return;
+  try {
+    const normalizedAddress = normalizeAddress(user);
+    const normalizedMode = String(mode || '').toLowerCase();
+    const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
+    let baseline = null;
+    if (stored && stored.remaining !== undefined && stored.remaining !== null) {
+      baseline = Number(stored.remaining);
+    } else {
+      const onchainRemaining = await getOracle().getRemainingInference(user, mode);
+      baseline = Number(onchainRemaining);
+    }
+    if (!Number.isFinite(baseline)) return;
+    const nextRemaining = Math.max(baseline - Number(quantity || 0), 0);
+    await recordInferenceUsageSnapshot({
+      user,
+      mode,
+      method,
+      quantity,
+      cost: 0,
+      contextHash,
+      reason,
+      remainingOverride: nextRemaining
+    });
+  } catch (err) {
+    console.error('[cacheAuthorizationUsage] error:', err.message || err);
+  }
+}
+
 async function settleInferenceAuthorization({
   user,
   mode,
@@ -857,6 +1105,16 @@ async function settleInferenceAuthorization({
     }
 
     const receipt = await tx.wait();
+    await recordInferenceUsageSnapshot({
+      user,
+      mode,
+      method,
+      quantity,
+      cost,
+      contextHash,
+      reason,
+      txHash: receipt.hash
+    });
     return {
       attempted: true,
       method,
@@ -891,6 +1149,17 @@ app.post('/inference/authorize', async (req, res) => {
 
     const result = await getOracle().authorizeInference(user, mode, numericQuantity);
     let settlement = { attempted: false, status: 'skipped' };
+
+    if (result?.allowed && result.method === 'subscription') {
+      await cacheAuthorizationUsage({
+        user: checksumUser,
+        mode,
+        quantity: numericQuantity,
+        method: result.method,
+        contextHash: contextHashValue,
+        reason: reasonValue
+      });
+    }
 
     if (
       settle &&
@@ -1081,8 +1350,22 @@ app.get('/users/:address/inference/remaining', async (req, res) => {
     const checksumAddr = normalizeHexAddress(addr);
     if (!checksumAddr) return res.status(400).json({ error: 'invalid address' });
     if (!mode || typeof mode !== 'string') return res.status(400).json({ error: 'mode query parameter required (basic, tags, price_accuracy, or full)' });
+    const normalizedAddress = normalizeAddress(checksumAddr);
+    const normalizedMode = mode.toLowerCase();
+
+    const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
+    if (stored && stored.remaining !== undefined && stored.remaining !== null) {
+      return res.json(serialize({
+        address: checksumAddr,
+        mode,
+        remaining: stored.remaining,
+        source: stored.source || 'neo4j',
+        updatedAt: stored.updatedAt || Date.now()
+      }));
+    }
+
     const remaining = await getOracle().getRemainingInference(checksumAddr, mode);
-    return res.json(serialize({ address: checksumAddr, mode, remaining }));
+    return res.json(serialize({ address: checksumAddr, mode, remaining, source: 'onchain' }));
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
