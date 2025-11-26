@@ -44,6 +44,13 @@ class RavenOracle {
         // In-memory helpers
         this._rateLimiter = new Map(); // user -> timestamps[] (ms)
         this._grantedInitial = new Set(); // process-local one-time credit grant guard
+
+        // Plan-level mode access control
+        this.PLAN_ALLOWED_MODES = {
+            1: new Set(['basic', 'tags']),
+            2: new Set(['basic', 'tags', 'price_accuracy']),
+            3: new Set(['basic', 'tags', 'price_accuracy', 'full'])
+        };
     }
 
     // Update user memory pointer on-chain (requires signer)
@@ -144,10 +151,17 @@ class RavenOracle {
 
         // 4) Prefer subscription if active
         const isSubscribed = !!subscription && Number(subscription.planId) > 0 && subscription.plan.active;
+        const normalizedMode = String(mode || '').toLowerCase();
         const cost = this.getInferenceCost(mode, quantity);
-        const isPriceAccuracyMode = mode === 'price_accuracy' || mode === 'full';
+        const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
 
         if (isSubscribed) {
+            const planId = Number(subscription.planId);
+            const allowedModes = this.PLAN_ALLOWED_MODES[planId];
+            if (allowedModes && !allowedModes.has(normalizedMode)) {
+                return { allowed: false, method: 'deny', reason: 'mode_not_in_plan', cost };
+            }
+
             const monthlyCap = Number(subscription.plan.monthlyCap);
             const used = Number(subscription.usedThisWindow);
             const effectiveCap = isPriceAccuracyMode ? this.GLOBAL_PRICE_ACCURACY_CAP : monthlyCap;
