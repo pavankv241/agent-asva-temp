@@ -737,10 +737,13 @@ function isModeAllowedForPlan(planId, mode) {
   const normalizedMode = String(mode || '').toLowerCase();
   switch (Number(planId)) {
     case 1:
+      // Plan 1: basic + tags
       return normalizedMode === 'basic' || normalizedMode === 'tags';
     case 2:
-      return normalizedMode === 'basic' || normalizedMode === 'tags' || normalizedMode === 'price_accuracy';
+      // Plan 2: tags-only
+      return normalizedMode === 'tags';
     case 3:
+      // Plan 3: full feature set
       return (
         normalizedMode === 'basic' ||
         normalizedMode === 'tags' ||
