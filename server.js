@@ -733,6 +733,25 @@ const inferenceStore = (() => {
   return new MemoryInferenceUsageStore();
 })();
 
+function isModeAllowedForPlan(planId, mode) {
+  const normalizedMode = String(mode || '').toLowerCase();
+  switch (Number(planId)) {
+    case 1:
+      return normalizedMode === 'basic' || normalizedMode === 'tags';
+    case 2:
+      return normalizedMode === 'basic' || normalizedMode === 'tags' || normalizedMode === 'price_accuracy';
+    case 3:
+      return (
+        normalizedMode === 'basic' ||
+        normalizedMode === 'tags' ||
+        normalizedMode === 'price_accuracy' ||
+        normalizedMode === 'full'
+      );
+    default:
+      return true;
+  }
+}
+
 async function ClearPendingCredits(trigger = 'timer') {
   const [pendingEngagements, pendingCalculations] = await Promise.all([
     engagementStore.fetchPendingEngagements(),
@@ -1352,6 +1371,24 @@ app.get('/users/:address/inference/remaining', async (req, res) => {
     if (!mode || typeof mode !== 'string') return res.status(400).json({ error: 'mode query parameter required (basic, tags, price_accuracy, or full)' });
     const normalizedAddress = normalizeAddress(checksumAddr);
     const normalizedMode = mode.toLowerCase();
+
+    // Ensure the user's plan allows this mode before reporting remaining
+    const subscription = await getOracle().getUserSubscription(checksumAddr);
+    const planId = subscription?.planId ?? subscription?.planId === 0 ? Number(subscription.planId) : Number(subscription?.planId || 0);
+    if (planId > 0 && subscription?.plan?.active) {
+      if (!isModeAllowedForPlan(planId, normalizedMode)) {
+        return res.json(serialize({
+          address: checksumAddr,
+          mode,
+          remaining: '0',
+          source: 'neo4j',
+          reason: 'mode_not_in_plan'
+        }));
+      }
+    } else if (planId === 0) {
+      // No subscription: rely on credits (but remaining query is subscription-based)
+      // Continue to cached/on-chain path which will likely return 0.
+    }
 
     const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
     if (stored && stored.remaining !== undefined && stored.remaining !== null) {
