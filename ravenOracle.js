@@ -48,11 +48,11 @@ class RavenOracle {
         // Plan-level mode access control
         this.PLAN_ALLOWED_MODES = {
             // Plan 1: basic + tags
-            1: new Set(['basic', 'tags']),
+            1: new Set(['basic']),
             // Plan 2: tags-only (no basic, no full/price_accuracy)
             2: new Set(['tags']),
             // Plan 3: full feature set
-            3: new Set(['basic', 'tags', 'price_accuracy', 'full'])
+            3: new Set([ 'price_accuracy', 'full'])
         };
     }
 
