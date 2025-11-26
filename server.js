@@ -1059,16 +1059,23 @@ async function cacheAuthorizationUsage({
     }
     if (!Number.isFinite(baseline)) return;
     const nextRemaining = Math.max(baseline - Number(quantity || 0), 0);
-    await recordInferenceUsageSnapshot({
-      user,
-      mode,
-      method,
-      quantity,
-      cost: 0,
-      contextHash,
-      reason,
-      remainingOverride: nextRemaining
-    });
+    // Keep all allowed modes in sync for this plan so remaining is a single shared pool
+    const subscription = await getOracle().getUserSubscription(user);
+    const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
+    const candidateModes = ['basic', 'tags', 'price_accuracy', 'full'];
+    for (const m of candidateModes) {
+      if (!isModeAllowedForPlan(planId, m)) continue;
+      await recordInferenceUsageSnapshot({
+        user,
+        mode: m,
+        method,
+        quantity,
+        cost: 0,
+        contextHash,
+        reason,
+        remainingOverride: nextRemaining
+      });
+    }
   } catch (err) {
     console.error('[cacheAuthorizationUsage] error:', err.message || err);
   }
