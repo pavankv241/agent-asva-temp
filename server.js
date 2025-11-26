@@ -1452,44 +1452,50 @@ app.get('/users/:address/inference/remaining', async (req, res) => {
   }
 });
 
-// Get remaining inference count using default mode per plan:
-// Plan 1 -> basic, Plan 2 -> tags, Plan 3 -> full
-app.get('/users/:address/inference/remaining/default', async (req, res) => {
+// Combined summary: subscription, credits, and remaining inference (auto mode)
+app.get('/users/:address/summary', async (req, res) => {
   try {
     const addr = req.params.address;
     const checksumAddr = normalizeHexAddress(addr);
     if (!checksumAddr) return res.status(400).json({ error: 'invalid address' });
 
-    const subscription = await getOracle().getUserSubscription(checksumAddr);
+    const [credits, subscription] = await Promise.all([
+      getOracle().getUserCredits(checksumAddr),
+      getOracle().getUserSubscription(checksumAddr)
+    ]);
+
     const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
+    const hasActiveSub = !!subscription && planId > 0 && subscription.plan?.active;
 
-    if (!subscription || planId === 0 || !subscription.plan?.active) {
-      return res.json(serialize({
-        address: checksumAddr,
-        mode: null,
-        remaining: '0',
-        source: 'onchain',
-        reason: 'no_subscription'
-      }));
+    let inferredMode = null;
+    if (hasActiveSub) {
+      if (planId === 1) inferredMode = 'basic';
+      else if (planId === 2) inferredMode = 'tags';
+      else if (planId === 3) inferredMode = 'full';
     }
 
-    let mode;
-    if (planId === 1) mode = 'basic';
-    else if (planId === 2) mode = 'tags';
-    else if (planId === 3) mode = 'full';
-    else {
-      return res.json(serialize({
-        address: checksumAddr,
-        mode: null,
-        remaining: '0',
-        source: 'onchain',
-        reason: 'unknown_plan'
-      }));
+    let inference = {
+      mode: inferredMode,
+      remaining: '0',
+      source: 'onchain'
+    };
+
+    if (!hasActiveSub || !inferredMode) {
+      inference.reason = 'no_subscription';
+    } else if (!isModeAllowedForPlan(planId, inferredMode)) {
+      inference.reason = 'mode_not_in_plan';
+    } else {
+      // Use the oracle helper for remaining; on-chain is source of truth
+      const remaining = await getOracle().getRemainingInference(checksumAddr, inferredMode);
+      inference.remaining = String(remaining);
     }
 
-    // Delegate to the existing handler logic by calling the same helper path
-    req.query.mode = mode;
-    return app._router.handle(req, res, () => {});
+    return res.json(serialize({
+      address: checksumAddr,
+      subscription: subscription || {},
+      credits,
+      inference
+    }));
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
