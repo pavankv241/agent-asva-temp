@@ -290,6 +290,7 @@ class MemoryInferenceUsageStore {
       remaining: entry.remaining,
       updatedAt: entry.updatedAt,
       method: entry.method,
+      planId: entry.planId ? Number(entry.planId) : null,
       source: this.source
     };
   }
@@ -376,7 +377,8 @@ class Neo4jInferenceUsageStore {
           MATCH (u:User {address: $address})-[:HAS_INFERENCE_USAGE]->(usage:InferenceUsage {mode: $mode})
           RETURN usage.remaining AS remaining,
                  usage.updatedAtMs AS updatedAtMs,
-                 usage.method AS method
+                 usage.method AS method,
+                 usage.planId AS planId
           `,
           { address, mode }
         )
@@ -387,6 +389,7 @@ class Neo4jInferenceUsageStore {
         remaining: record.get('remaining'),
         updatedAt: Number(record.get('updatedAtMs') || 0),
         method: record.get('method'),
+        planId: record.get('planId') ? Number(record.get('planId')) : null,
         source: this.source
       };
     } catch (err) {
@@ -1424,17 +1427,46 @@ app.get('/users/:address/summary', async (req, res) => {
 
       // Prefer cached Neo4j remaining (kept in sync by authorizeInference)
       const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
-      if (stored && stored.remaining !== undefined && stored.remaining !== null && Number(stored.remaining) >= 0) {
+      
+      // Check if cached planId matches current planId, or if subscription was recently renewed
+      const cachedPlanId = stored?.planId;
+      const subscriptionRenewedRecently = subscription?.lastRenewedAt 
+        ? (Date.now() / 1000 - Number(subscription.lastRenewedAt)) < 300 // Within last 5 minutes
+        : false;
+      
+      const planChanged = cachedPlanId !== null && cachedPlanId !== planId;
+      const shouldRefresh = planChanged || subscriptionRenewedRecently;
+      
+      if (stored && stored.remaining !== undefined && stored.remaining !== null && Number(stored.remaining) >= 0 && !shouldRefresh) {
+        // Use cached value if plan hasn't changed and subscription wasn't recently renewed
         inference.remaining = String(stored.remaining);
         inference.source = stored.source || 'neo4j';
         if (stored.updatedAt) {
           inference.updatedAt = stored.updatedAt;
         }
       } else {
-        // Fallback to on-chain helper
+        // Refresh from on-chain (plan changed or subscription renewed)
         const remaining = await getOracle().getRemainingInference(checksumAddr, inferredMode);
         inference.remaining = String(remaining);
         inference.source = 'onchain';
+        
+        // Update cache with fresh on-chain data
+        if (hasActiveSub && Number(remaining) >= 0) {
+          try {
+            await recordInferenceUsageSnapshot({
+              user: checksumAddr,
+              mode: inferredMode,
+              method: 'subscription',
+              quantity: 0,
+              cost: 0,
+              contextHash: '',
+              reason: planChanged ? 'plan_changed' : 'subscription_renewed',
+              remainingOverride: Number(remaining)
+            });
+          } catch (err) {
+            console.error('[summary] failed to refresh cache after plan change/renewal', err);
+          }
+        }
       }
     }
 
