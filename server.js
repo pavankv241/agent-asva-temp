@@ -97,9 +97,21 @@ function getNeo4jDriver() {
     _neo4jDriver = neo4j.driver(
       NEO4J_URI,
       neo4j.auth.basic(NEO4J_USERNAME, NEO4J_PASSWORD),
-      { disableLosslessIntegers: true }
+      { 
+        disableLosslessIntegers: true,
+        maxConnectionLifetime: 3 * 60 * 60 * 1000, // 3 hours
+        maxConnectionPoolSize: 50,
+        connectionAcquisitionTimeout: 60 * 1000, // 60 seconds
+        connectionTimeout: 30 * 1000 // 30 seconds
+      }
     );
-    console.log('[engagement-store] Connected to Neo4j');
+    // Test connection
+    _neo4jDriver.verifyConnectivity().then(() => {
+      console.log('[engagement-store] Connected to Neo4j');
+    }).catch((err) => {
+      console.error('[engagement-store] Neo4j connection verification failed:', err.message);
+      // Don't set to null here, let individual queries handle errors
+    });
   } catch (err) {
     console.error('[engagement-store] Failed to init Neo4j driver:', err.message);
     _neo4jDriver = null;
@@ -288,6 +300,10 @@ class Neo4jEngagementStore {
       );
       const pendingCredits = result.records[0]?.get('pendingCredits') ?? event.credits;
       return { pendingCredits: Number(pendingCredits || 0) };
+    } catch (err) {
+      console.error('[Neo4jEngagementStore] Error recording engagement:', err.message);
+      // Return pending credits from event on error
+      return { pendingCredits: event.credits };
     } finally {
       await session.close();
     }
@@ -323,6 +339,10 @@ class Neo4jEngagementStore {
           createdAt: Number(node.properties.createdAtMs || 0)
         }));
       return { address, pendingCredits, pendingEvents };
+    } catch (err) {
+      console.error('[Neo4jEngagementStore] Error getting pending for user:', err.message);
+      // Return empty result on error
+      return { address, pendingCredits: 0, pendingEvents: [] };
     } finally {
       await session.close();
     }
@@ -371,6 +391,10 @@ class Neo4jEngagementStore {
       }));
 
       return { pendingCredits, pendingEngagements };
+    } catch (err) {
+      console.error('[Neo4jEngagementStore] Error getting all pending:', err.message);
+      // Return empty result on error
+      return { pendingCredits: [], pendingEngagements: [] };
     } finally {
       await session.close();
     }
@@ -461,6 +485,10 @@ class Neo4jEngagementStore {
       );
       const totalCalculatedCredits = result.records[0]?.get('totalCalculatedCredits') ?? credits;
       return { totalCalculatedCredits: Number(totalCalculatedCredits || 0) };
+    } catch (err) {
+      console.error('[Neo4jEngagementStore] Error recording calculated credits:', err.message);
+      // Return credits from parameter on error (at least track it in memory)
+      return { totalCalculatedCredits: credits };
     } finally {
       await session.close();
     }
@@ -483,6 +511,10 @@ class Neo4jEngagementStore {
         ? Number(result.records[0].get('totalCalculatedCredits') || 0) 
         : 0;
       return { address, totalCalculatedCredits };
+    } catch (err) {
+      console.error('[Neo4jEngagementStore] Error getting calculated credits:', err.message);
+      // Return 0 on error instead of throwing
+      return { address, totalCalculatedCredits: 0 };
     } finally {
       await session.close();
     }
@@ -772,19 +804,121 @@ app.post('/inference/estimate', (req, res) => {
   }
 });
 
+async function settleInferenceAuthorization({
+  user,
+  mode,
+  quantity,
+  method,
+  cost,
+  contextHash,
+  reason
+}) {
+  const normalizedMode = String(mode || '').toLowerCase();
+  const settlement = {
+    attempted: true,
+    method,
+    status: 'skipped'
+  };
+
+  const signer = getSigner();
+  const contract = getTreasuryContract();
+  if (!signer || !contract) {
+    return {
+      ...settlement,
+      status: 'error',
+      message: 'oracle signer not configured'
+    };
+  }
+
+  try {
+    let tx = null;
+    if (method === 'credits') {
+      if (!Number.isFinite(cost) || cost <= 0) {
+        return { ...settlement, status: 'error', message: 'invalid cost for credit settlement' };
+      }
+      tx = await contract.deductCredits(
+        user,
+        BigInt(cost),
+        reason || `inference_${normalizedMode || 'generic'}`,
+        contextHash || ''
+      );
+    } else if (method === 'subscription') {
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        return { ...settlement, status: 'error', message: 'invalid quantity for subscription settlement' };
+      }
+      const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
+      tx = await contract.consumeSubscriptionUsage(
+        user,
+        BigInt(Math.trunc(quantity)),
+        isPriceAccuracyMode
+      );
+    } else {
+      return { ...settlement, status: 'skipped', message: `method ${method} does not require settlement` };
+    }
+
+    const receipt = await tx.wait();
+    return {
+      attempted: true,
+      method,
+      status: 'ok',
+      txHash: receipt.hash
+    };
+  } catch (err) {
+    console.error('[settleInferenceAuthorization] failed', err);
+    return {
+      attempted: true,
+      method,
+      status: 'error',
+      message: err.message || 'settlement tx failed'
+    };
+  }
+}
+
 // Authorization helper (reads on-chain state)
-// body: { user: string, mode: string, quantity?: number }
+// body: { user: string, mode: string, quantity?: number, settle?: boolean, contextHash?: string, reason?: string }
 app.post('/inference/authorize', async (req, res) => {
   try {
-    const { user, mode, quantity = 1 } = req.body || {};
+    const { user, mode, quantity = 1, settle = false, contextHash = '', reason } = req.body || {};
     const checksumUser = normalizeHexAddress(user);
     if (!checksumUser) return res.status(400).json({ error: 'valid user address required' });
-    const result = await getOracle().authorizeInference(user, mode, Number(quantity));
-    return res.json(serialize(result));
+    if (typeof mode !== 'string' || mode.length === 0) return res.status(400).json({ error: 'mode required' });
+    const numericQuantity = Number(quantity);
+    if (!Number.isFinite(numericQuantity) || numericQuantity <= 0) {
+      return res.status(400).json({ error: 'quantity must be > 0' });
+    }
+    const contextHashValue = typeof contextHash === 'string' ? contextHash : '';
+    const reasonValue = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
+
+    const result = await getOracle().authorizeInference(user, mode, numericQuantity);
+    let settlement = { attempted: false, status: 'skipped' };
+
+    if (
+      settle &&
+      result?.allowed &&
+      (result.method === 'credits' || result.method === 'subscription')
+    ) {
+      settlement = await settleInferenceAuthorization({
+        user: checksumUser,
+        mode,
+        quantity: numericQuantity,
+        method: result.method,
+        cost: result.cost,
+        contextHash: contextHashValue,
+        reason: reasonValue
+      });
+    }
+
+    return res.json(serialize({
+      ...result,
+      contextHash: contextHashValue,
+      settlement
+    }));
   } catch (e) {
     return res.status(400).json({ error: e.message });
   }
 });
+
+// TODO: Add a inference check also offchain.
 
 /*  Front-end example:
 import { ethers } from 'ethers';
@@ -915,6 +1049,13 @@ app.get('/users/:address/credits/calculated', async (req, res) => {
     const data = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
     return res.json(serialize(data));
   } catch (e) {
+    console.error('[GET /users/:address/credits/calculated] Error:', e.message);
+    // Return empty result instead of error to prevent frontend crashes
+    const addr = req.params.address;
+    const checksumAddr = normalizeHexAddress(addr);
+    if (checksumAddr) {
+      return res.json(serialize({ address: normalizeAddress(checksumAddr), totalCalculatedCredits: 0 }));
+    }
     return res.status(500).json({ error: e.message });
   }
 });
