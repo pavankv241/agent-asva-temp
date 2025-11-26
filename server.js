@@ -1437,6 +1437,49 @@ app.get('/users/:address/inference/remaining', async (req, res) => {
   }
 });
 
+// Get remaining inference count using default mode per plan:
+// Plan 1 -> basic, Plan 2 -> tags, Plan 3 -> full
+app.get('/users/:address/inference/remaining/default', async (req, res) => {
+  try {
+    const addr = req.params.address;
+    const checksumAddr = normalizeHexAddress(addr);
+    if (!checksumAddr) return res.status(400).json({ error: 'invalid address' });
+
+    const subscription = await getOracle().getUserSubscription(checksumAddr);
+    const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
+
+    if (!subscription || planId === 0 || !subscription.plan?.active) {
+      return res.json(serialize({
+        address: checksumAddr,
+        mode: null,
+        remaining: '0',
+        source: 'onchain',
+        reason: 'no_subscription'
+      }));
+    }
+
+    let mode;
+    if (planId === 1) mode = 'basic';
+    else if (planId === 2) mode = 'tags';
+    else if (planId === 3) mode = 'full';
+    else {
+      return res.json(serialize({
+        address: checksumAddr,
+        mode: null,
+        remaining: '0',
+        source: 'onchain',
+        reason: 'unknown_plan'
+      }));
+    }
+
+    // Delegate to the existing handler logic by calling the same helper path
+    req.query.mode = mode;
+    return app._router.handle(req, res, () => {});
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // Check if a user has an active subscription (boolean)
 app.get('/users/:address/has-active-subscription', async (req, res) => {
   try {
