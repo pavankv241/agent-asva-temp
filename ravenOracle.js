@@ -28,7 +28,7 @@ class RavenOracle {
         // Inference mode costs (credits)
         this.COSTS = {
             basic: 1,
-            tags: 2,
+            tags: 1,
             price_accuracy: 4,
             full: 6,
             scores: {
@@ -362,7 +362,9 @@ class RavenOracle {
             // Writes
             "function updateUserMemoryPointer(address user, string memoryHash) external",
             "function awardCredits(address user, uint256 amount, string reason) external",
-            "function awardCreditsBatch(address[] users, uint256[] amounts, string reason) external"
+            "function awardCreditsBatch(address[] users, uint256[] amounts, string reason) external",
+            "function deductCredits(address user, uint256 amount, string reason, string contextHash) external",
+            "function consumeSubscriptionUsage(address user, uint256 quantity, bool isPriceAccuracyMode) external"
         ];
     }
 }
