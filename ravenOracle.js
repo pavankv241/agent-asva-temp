@@ -29,6 +29,7 @@ class RavenOracle {
         this.COSTS = {
             // Base modes
             basic: 1, // general reasoning
+            general: 1,
             tags: 1,
             price_accuracy: 4,
             full: 6, // legacy alias, treated as premium reasoning bundle
@@ -56,6 +57,7 @@ class RavenOracle {
             generalreasoning: 'basic',
             gen_reasoning: 'basic',
             reasoning: 'basic',
+            general: 'basic',
             tags_general_reasoning: 'basic_and_tags',
             tags_gen_reasoning: 'basic_and_tags',
             tags_reasoning: 'basic_and_tags',
