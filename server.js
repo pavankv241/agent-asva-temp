@@ -1206,7 +1206,36 @@ app.post('/inference/authorize', async (req, res) => {
       return res.status(400).json({ error: 'mode required or cannot infer from subscription plan' });
     }
 
-    const result = await getOracle().authorizeInference(user, resolvedMode, numericQuantity);
+    // Calculate pending usage from Neo4j to prevent exceeding cap before settlement
+    // This ensures users can't exceed their monthly cap even if settlement happens hourly
+    let pendingUsageFromNeo4j = 0;
+    try {
+      const subscription = await getOracle().getUserSubscription(checksumUser);
+      if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
+        const normalizedAddress = normalizeAddress(checksumUser);
+        const normalizedMode = resolvedMode.toLowerCase();
+        const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
+        
+        // Only use Neo4j pending usage if planId matches (cache is for current plan)
+        const currentPlanId = Number(subscription.planId);
+        const cachedPlanId = stored?.planId;
+        if (stored && stored.remaining !== undefined && stored.remaining !== null && 
+            cachedPlanId !== null && cachedPlanId === currentPlanId) {
+          const monthlyCap = Number(subscription.plan.monthlyCap);
+          const onChainUsed = Number(subscription.usedThisWindow);
+          const remainingFromNeo4j = Number(stored.remaining);
+          // Calculate pending: total used (from remaining) - on-chain settled usage
+          // remaining = monthlyCap - totalUsed, so totalUsed = monthlyCap - remaining
+          const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
+          pendingUsageFromNeo4j = Math.max(0, totalUsedFromNeo4j - onChainUsed);
+        }
+      }
+    } catch (err) {
+      console.error('[authorize] Error calculating pending usage from Neo4j:', err.message || err);
+      // Continue with on-chain check only if Neo4j fails
+    }
+
+    const result = await getOracle().authorizeInference(user, resolvedMode, numericQuantity, pendingUsageFromNeo4j);
     let settlement = { attempted: false, status: 'skipped' };
 
     if (result?.allowed && result.method === 'subscription') {
