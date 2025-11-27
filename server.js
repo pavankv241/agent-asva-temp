@@ -1209,7 +1209,7 @@ async function recordInferenceUsageSnapshot({
   if (!inferenceStore) return null;
   try {
     const normalizedAddress = normalizeAddress(user);
-    const normalizedMode = String(mode || 'general').toLowerCase();
+    const normalizedMode = String(mode || 'basic').toLowerCase();
     const payload = {
       address: normalizedAddress,
       mode: normalizedMode,
@@ -1402,7 +1402,7 @@ app.post('/inference/authorize', async (req, res) => {
     const reasonValue = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
     let resolvedMode = (typeof mode === 'string' && mode.length > 0) ? mode : null;
     if (!resolvedMode) {
-      resolvedMode = 'general';
+      resolvedMode = 'basic';
     }
 
     // Calculate pending usage from Neo4j to prevent exceeding cap before settlement
