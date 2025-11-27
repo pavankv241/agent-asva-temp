@@ -143,7 +143,7 @@ class RavenOracle {
             return reasonCost * quantity;
         }
 
-        const normalized = String(mode || 'general').toLowerCase();
+        const normalized = String(mode || 'basic').toLowerCase();
         const path = normalized.split('.').filter(Boolean);
         if (!path.length) throw new Error('mode required');
 
@@ -199,7 +199,7 @@ class RavenOracle {
 
         // 4) Prefer subscription if active
         const isSubscribed = !!subscription && Number(subscription.planId) > 0 && subscription.plan.active;
-        const normalizedMode = String(mode || 'general').toLowerCase();
+        const normalizedMode = String(mode || 'basic').toLowerCase();
         const normalizedReason = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
         const cost = this.getInferenceCost(normalizedMode, quantity, normalizedReason);
         const isPriceAccuracyMode =
