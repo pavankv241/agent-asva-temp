@@ -1342,9 +1342,15 @@ async function cacheAuthorizationUsage({
       // Use cached value only if plan hasn't changed
       baseline = Number(stored.remaining);
     } else {
-      // Fetch fresh from on-chain (cache miss or plan changed)
-      const onchainRemaining = await getOracle().getRemainingInference(user, mode);
-      baseline = Number(onchainRemaining);
+      // Plan changed or cache miss: reset to new plan's monthlyCap
+      const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
+      if (planMonthlyCap > 0) {
+        baseline = planMonthlyCap;
+      } else {
+        // Fallback to on-chain if no plan
+        const onchainRemaining = await getOracle().getRemainingInference(user, mode);
+        baseline = Number(onchainRemaining);
+      }
     }
 
     if (!Number.isFinite(baseline)) return;
@@ -1658,26 +1664,20 @@ app.get('/users/:address/summary', async (req, res) => {
     const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
     const hasActiveSub = !!subscription && planId > 0 && subscription.plan?.active;
 
-    let inferredMode = null;
-    if (hasActiveSub) {
-      if (planId === 1) inferredMode = 'basic';
-      else if (planId === 2) inferredMode = 'tags';
-      else if (planId === 3) inferredMode = 'full';
-    }
+    // Use 'general' as default mode since all modes share the same subscription pool
+    const checkMode = 'general';
 
     let inference = {
-      mode: inferredMode,
+      mode: checkMode,
       remaining: '0',
       source: 'onchain'
     };
 
-    if (!hasActiveSub || !inferredMode) {
+    if (!hasActiveSub) {
       inference.reason = 'no_subscription';
-    } else if (!isModeAllowedForPlan(planId, inferredMode)) {
-      inference.reason = 'mode_not_in_plan';
     } else {
       const normalizedAddress = normalizeAddress(checksumAddr);
-      const normalizedMode = inferredMode.toLowerCase();
+      const normalizedMode = checkMode.toLowerCase();
 
       // Prefer cached Neo4j remaining (kept in sync by authorizeInference)
       const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
@@ -1699,24 +1699,37 @@ app.get('/users/:address/summary', async (req, res) => {
           inference.updatedAt = stored.updatedAt;
         }
       } else {
-        // Refresh from on-chain (plan changed or subscription renewed)
-        const remaining = await getOracle().getRemainingInference(checksumAddr, inferredMode);
-        inference.remaining = String(remaining);
-        inference.source = 'onchain';
+        // Plan changed or subscription renewed: reset to new plan's monthlyCap
+        const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
+        let remaining = planMonthlyCap;
         
-        // Update cache with fresh on-chain data
+        if (planChanged && planMonthlyCap > 0) {
+          // Plan changed: reset to new plan's full cap
+          remaining = planMonthlyCap;
+        } else if (subscriptionRenewedRecently) {
+          // Subscription renewed: fetch from on-chain (should be reset to cap)
+          remaining = await getOracle().getRemainingInference(checksumAddr, checkMode);
+        }
+        
+        inference.remaining = String(remaining);
+        inference.source = planChanged ? 'plan_reset' : 'onchain';
+        
+        // Update cache with fresh data for all modes
         if (hasActiveSub && Number(remaining) >= 0) {
           try {
-            await recordInferenceUsageSnapshot({
-              user: checksumAddr,
-              mode: inferredMode,
-              method: 'subscription',
-              quantity: 0,
-              cost: 0,
-              contextHash: '',
-              reason: planChanged ? 'plan_changed' : 'subscription_renewed',
-              remainingOverride: Number(remaining)
-            });
+            const snapshotModes = ['basic', 'tags', 'price_accuracy', 'full', 'general'];
+            for (const m of snapshotModes) {
+              await recordInferenceUsageSnapshot({
+                user: checksumAddr,
+                mode: m,
+                method: 'subscription',
+                quantity: 0,
+                cost: 0,
+                contextHash: '',
+                reason: planChanged ? 'plan_changed' : 'subscription_renewed',
+                remainingOverride: Number(remaining)
+              });
+            }
           } catch (err) {
             console.error('[summary] failed to refresh cache after plan change/renewal', err);
           }
