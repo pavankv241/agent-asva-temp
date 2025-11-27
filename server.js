@@ -1297,7 +1297,7 @@ async function cacheCreditAuthorization({ user, cost, contextHash, reason }) {
   }
 }
 
-async function recordSubscriptionEarnedCredits({ user, credits, planId }) {
+async function recordSubscriptionEarnedCredits({ user, credits, planId, reason }) {
   if (!engagementStore) return;
   const amount = Number(credits);
   if (!Number.isFinite(amount) || amount <= 0) return;
@@ -1305,7 +1305,7 @@ async function recordSubscriptionEarnedCredits({ user, credits, planId }) {
     const normalized = normalizeAddress(user);
     await engagementStore.recordCalculatedCredits(
       normalized,
-      'subscription_usage_reward',
+      reason || 'subscription_usage_reward',
       Number(planId) || 0,
       amount
     );
@@ -1779,9 +1779,14 @@ app.post('/credits/initial-grant', async (req, res) => {
       return res.status(400).json({ error: 'not eligible (has credits or active subscription)' });
     }
 
-    const iface = new ethers.Interface(getOracle().getAccessABI());
-    const data = iface.encodeFunctionData('awardCredits', [checksumUser, 50, 'initial_grant']);
-    return res.json(serialize({ to: RAVEN_ACCESS_ADDRESS, data }));
+    const normalized = normalizeAddress(checksumUser);
+    await recordSubscriptionEarnedCredits({
+      user: normalized,
+      credits: 50,
+      planId: 0,
+      reason: 'initial_grant'
+    });
+    return res.json(serialize({ status: 'ok', cached: true }));
   } catch (e) {
     return res.status(400).json({ error: e.message });
   }
