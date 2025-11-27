@@ -1209,7 +1209,7 @@ async function recordInferenceUsageSnapshot({
   if (!inferenceStore) return null;
   try {
     const normalizedAddress = normalizeAddress(user);
-    const normalizedMode = String(mode || '').toLowerCase();
+    const normalizedMode = String(mode || 'general').toLowerCase();
     const payload = {
       address: normalizedAddress,
       mode: normalizedMode,
@@ -1361,9 +1361,8 @@ async function cacheAuthorizationUsage({
     }
 
     // Keep all allowed modes in sync for this plan so remaining is a single shared pool
-    const candidateModes = ['basic', 'tags', 'price_accuracy', 'full'];
-    for (const m of candidateModes) {
-      if (!isModeAllowedForPlan(currentPlanId, m)) continue;
+    const snapshotModes = ['basic', 'tags', 'price_accuracy', 'full', 'general'];
+    for (const m of snapshotModes) {
       await recordInferenceUsageSnapshot({
         user,
         mode: m,
@@ -1402,23 +1401,8 @@ app.post('/inference/authorize', async (req, res) => {
     const contextHashValue = typeof contextHash === 'string' ? contextHash : '';
     const reasonValue = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
     let resolvedMode = (typeof mode === 'string' && mode.length > 0) ? mode : null;
-
-    // If mode not provided, infer from active subscription plan:
-    // Plan 1 -> basic, Plan 2 -> tags, Plan 3 -> full
-    let subscriptionForInference = null;
     if (!resolvedMode) {
-      subscriptionForInference = await getOracle().getUserSubscription(checksumUser);
-      const planId = subscriptionForInference ? Number(subscriptionForInference.planId ?? subscriptionForInference[0] ?? 0) : 0;
-      const hasActiveSub = !!subscriptionForInference && planId > 0 && subscriptionForInference.plan?.active;
-      if (hasActiveSub) {
-        if (planId === 1) resolvedMode = 'basic';
-        else if (planId === 2) resolvedMode = 'tags';
-        else if (planId === 3) resolvedMode = 'full';
-      }
-    }
-
-    if (!resolvedMode) {
-      return res.status(400).json({ error: 'mode required or cannot infer from subscription plan' });
+      resolvedMode = 'general';
     }
 
     // Calculate pending usage from Neo4j to prevent exceeding cap before settlement
