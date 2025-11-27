@@ -997,21 +997,27 @@ async function recordInferenceUsageSnapshot({
     };
 
     if (method === 'subscription') {
+      const oracle = getOracle();
+      const subscription = await oracle.getUserSubscription(user);
+      if (!subscription || Number(subscription.planId) === 0) return null;
+
+      const planMonthlyCap = Number(subscription.plan?.monthlyCap ?? 0);
+      const planId = Number(subscription.planId);
+      const used = Number(subscription.usedThisWindow ?? 0);
+      const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
+      const effectiveCap = isPriceAccuracyMode ? Number(oracle.GLOBAL_PRICE_ACCURACY_CAP) : planMonthlyCap;
+
       let remainingValue = remainingOverride;
-      let planMonthlyCap = undefined;
-      let planId = undefined;
-      let used = undefined;
-      if (remainingValue === undefined) {
-        const oracle = getOracle();
-        const subscription = await oracle.getUserSubscription(user);
-        if (!subscription || Number(subscription.planId) === 0) return null;
-        planMonthlyCap = Number(subscription.plan?.monthlyCap ?? 0);
-        planId = Number(subscription.planId);
-        used = Number(subscription.usedThisWindow ?? 0);
-        const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
-        const effectiveCap = isPriceAccuracyMode ? Number(oracle.GLOBAL_PRICE_ACCURACY_CAP) : planMonthlyCap;
-        remainingValue = Math.max(effectiveCap - used, 0);
+      if (remainingValue !== undefined && remainingValue !== null) {
+        remainingValue = Number(remainingValue);
       }
+
+      if (!Number.isFinite(remainingValue)) {
+        remainingValue = Math.max(effectiveCap - used, 0);
+      } else {
+        remainingValue = Math.max(Math.min(remainingValue, effectiveCap), 0);
+      }
+
       payload.planMonthlyCap = planMonthlyCap;
       payload.planId = planId;
       payload.usedThisWindow = used;
@@ -1219,7 +1225,7 @@ app.post('/inference/authorize', async (req, res) => {
         // Only use Neo4j pending usage if planId matches (cache is for current plan)
         const currentPlanId = Number(subscription.planId);
         const cachedPlanId = stored?.planId;
-        if (stored && stored.remaining !== undefined && stored.remaining !== null && 
+        if (stored && stored.remaining !== undefined && stored.remaining !== null &&
             cachedPlanId !== null && cachedPlanId === currentPlanId) {
           const monthlyCap = Number(subscription.plan.monthlyCap);
           const onChainUsed = Number(subscription.usedThisWindow);
