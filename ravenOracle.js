@@ -27,14 +27,52 @@ class RavenOracle {
 
         // Inference mode costs (credits)
         this.COSTS = {
-            basic: 1,
+            // Base modes
+            basic: 1, // general reasoning
             tags: 1,
             price_accuracy: 4,
-            full: 6,
+            full: 6, // legacy alias, treated as premium reasoning bundle
             scores: {
                 logic: 2,
                 sentiment: 2
-            }
+            },
+            scores_default: 2,
+            // Pricing combinations
+            basic_and_tags: 2,
+            basic_and_price_accuracy: 4,
+            scores_and_basic: 4,
+            scores_basic_price_accuracy: 6,
+            tags_scores_basic: 3,
+            tags_price_accuracy: 4,
+            tags_price_accuracy_basic: 5,
+            // Tags automatically absorb accuracy/scores surcharges when included
+            // Score-specific variants (flat 2 credits regardless of ordering)
+            scores_logic: 2,
+            scores_sentiment: 2
+        };
+
+        this.COST_ALIASES = {
+            general_reasoning: 'basic',
+            generalreasoning: 'basic',
+            gen_reasoning: 'basic',
+            reasoning: 'basic',
+            tags_general_reasoning: 'basic_and_tags',
+            tags_gen_reasoning: 'basic_and_tags',
+            tags_reasoning: 'basic_and_tags',
+            general_reasoning_accuracy: 'basic_and_price_accuracy',
+            gen_reasoning_accuracy: 'basic_and_price_accuracy',
+            reasoning_accuracy: 'basic_and_price_accuracy',
+            scores_reasoning: 'scores_and_basic',
+            scores_general_reasoning: 'scores_and_basic',
+            scores_gen_reasoning: 'scores_and_basic',
+            scores_reasoning_accuracy: 'scores_basic_price_accuracy',
+            scores_general_reasoning_accuracy: 'scores_basic_price_accuracy',
+            tags_scores_reasoning: 'tags_scores_basic',
+            tags_scores_general_reasoning: 'tags_scores_basic',
+            tags_accuracy: 'tags_price_accuracy',
+            tags_accuracy_reasoning: 'tags_price_accuracy_basic',
+            tags_accuracy_general_reasoning: 'tags_price_accuracy_basic',
+            tags_accuracy_gen_reasoning: 'tags_price_accuracy_basic'
         };
 
         // Constraint constants
@@ -45,15 +83,7 @@ class RavenOracle {
         this._rateLimiter = new Map(); // user -> timestamps[] (ms)
         this._grantedInitial = new Set(); // process-local one-time credit grant guard
 
-        // Plan-level mode access control
-        this.PLAN_ALLOWED_MODES = {
-            // Plan 1: basic + tags
-            1: new Set(['basic']),
-            // Plan 2: tags-only (no basic, no full/price_accuracy)
-            2: new Set(['tags']),
-            // Plan 3: full feature set
-            3: new Set([ 'price_accuracy', 'full'])
-        };
+        // Plans now gate only monthly caps; any user may request any supported mode.
     }
 
     // Update user memory pointer on-chain (requires signer)
@@ -103,21 +133,31 @@ class RavenOracle {
 
 
     // Compute credit cost for an inference request
-    getInferenceCost(mode, quantity = 1) {
-        const path = String(mode).split('.').filter(Boolean);
+    getInferenceCost(mode, quantity = 1, reason) {
+        if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('quantity must be > 0');
+
+        const reasonCost = this._computeReasonCost(reason);
+        if (Number.isFinite(reasonCost)) {
+            return reasonCost * quantity;
+        }
+
+        const normalized = String(mode || '').toLowerCase();
+        const path = normalized.split('.').filter(Boolean);
         if (!path.length) throw new Error('mode required');
 
         let unit;
         if (path.length === 1) {
             unit = this.COSTS[path[0]];
+            if (path[0] === 'scores' && !Number.isFinite(unit)) {
+                unit = this.COSTS.scores_default;
+            }
         } else if (path.length === 2 && path[0] === 'scores') {
-            unit = this.COSTS.scores?.[path[1]];
+            unit = this.COSTS.scores?.[path[1]] ?? this.COSTS[`scores_${path[1]}`];
         } else {
             throw new Error(`Unknown mode: ${mode}`);
         }
 
         if (!Number.isFinite(unit)) throw new Error(`Unknown mode: ${mode}`);
-        if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('quantity must be > 0');
         return unit * quantity;
     }
 
@@ -136,7 +176,8 @@ class RavenOracle {
 
     // Read-only authorization decision based on  priorities
     // Returns: { allowed, method: 'subscription'|'credits'|'deny', reason, cost }
-    async authorizeInference(userAddress, mode, quantity = 1) {
+    // pendingUsageFromNeo4j: optional pending usage count from Neo4j cache (to prevent exceeding cap before settlement)
+    async authorizeInference(userAddress, mode, quantity = 1, pendingUsageFromNeo4j = 0, pendingCreditsFromNeo4j = 0, reason) {
         // 1) Rate limit
         if (this.isRateLimited(userAddress)) {
             return { allowed: false, method: 'deny', reason: 'rate_limited', cost: 0 };
@@ -146,6 +187,8 @@ class RavenOracle {
         const subscription = await this.getUserSubscription(userAddress);
         const creditsStr = await this.getUserCredits(userAddress);
         const credits = BigInt(creditsStr);
+        const pendingCredits = BigInt(pendingCreditsFromNeo4j || 0);
+        const effectiveCredits = credits > pendingCredits ? credits - pendingCredits : 0n;
 
         // 3) Initial one-time 50-credits allowance (process-local guard)
         if (!this._grantedInitial.has(userAddress) && credits === 0n && (!subscription || subscription.planId === 0)) {
@@ -155,41 +198,60 @@ class RavenOracle {
         // 4) Prefer subscription if active
         const isSubscribed = !!subscription && Number(subscription.planId) > 0 && subscription.plan.active;
         const normalizedMode = String(mode || '').toLowerCase();
-        const cost = this.getInferenceCost(mode, quantity);
-        const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
+        const normalizedReason = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
+        const cost = this.getInferenceCost(normalizedMode, quantity, normalizedReason);
+        const isPriceAccuracyMode =
+            normalizedMode === 'price_accuracy' ||
+            normalizedMode === 'full' ||
+            normalizedMode.includes('price_accuracy');
 
         if (isSubscribed) {
-            const planId = Number(subscription.planId);
-            const allowedModes = this.PLAN_ALLOWED_MODES[planId];
-            if (allowedModes && !allowedModes.has(normalizedMode)) {
-                return { allowed: false, method: 'deny', reason: 'mode_not_in_plan', cost };
-            }
-
             const monthlyCap = Number(subscription.plan.monthlyCap);
             const used = Number(subscription.usedThisWindow);
+            const pendingUsage = Number(pendingUsageFromNeo4j) || 0;
             // Use per-plan monthlyCap for all modes (Plan1=3000, Plan2=4000, Plan3=5000)
+            // Include pending usage from Neo4j to prevent exceeding cap before settlement
             const effectiveCap = monthlyCap;
-            if (used + quantity <= effectiveCap) {
+            const totalUsed = used + pendingUsage;
+            if (totalUsed + quantity <= effectiveCap) {
                 return { allowed: true, method: 'subscription', reason: 'within_subscription_cap', cost: 0 };
             }
         }
 
         // 5) Charge credits if available (no subscription / exhausted cap)
-        if (credits >= BigInt(cost)) {
-            return { allowed: true, method: 'credits', reason: 'sufficient_credits', cost };
+        if (effectiveCredits >= BigInt(cost)) {
+            return {
+                allowed: true,
+                method: 'credits',
+                reason: 'sufficient_credits',
+                cost,
+                creditsAvailable: effectiveCredits.toString(),
+                creditsOnChain: credits.toString(),
+                pendingCredits: pendingCredits.toString()
+            };
         }
 
         // 6) Fallback: if credits unavailable but subscription still has room (unlikely due to above), allow
         if (isSubscribed) {
             const monthlyCap = Number(subscription.plan.monthlyCap);
             const used = Number(subscription.usedThisWindow);
+            const pendingUsage = Number(pendingUsageFromNeo4j) || 0;
             const effectiveCap = isPriceAccuracyMode ? this.GLOBAL_PRICE_ACCURACY_CAP : monthlyCap;
-            if (used + quantity <= effectiveCap) {
+            const totalUsed = used + pendingUsage;
+            if (totalUsed + quantity <= effectiveCap) {
                 return { allowed: true, method: 'subscription', reason: 'fallback_subscription', cost: 0 };
             }
         }
 
-        return { allowed: false, method: 'deny', reason: 'insufficient_balance_and_cap', cost };
+        return {
+            allowed: false,
+            method: 'deny',
+            reason: 'insufficient_balance_and_cap',
+            cost,
+            creditsAvailable: effectiveCredits.toString(),
+            creditsOnChain: credits.toString(),
+            pendingCredits: pendingCredits.toString()
+        };
     }
 
     // Attempt a one-time initial grant of 50 credits on-chain (requires oracle/owner signer)
@@ -305,6 +367,127 @@ class RavenOracle {
             default:
                 return parameter; // Custom reasons (fallback)
         }
+    }
+
+    _normalizeCostKey(key) {
+        return String(key || '')
+            .trim()
+            .toLowerCase()
+            .replace(/[+\s-]+/g, '_')
+            .replace(/[^a-z0-9_.]/g, '');
+    }
+
+    _lookupCostByKey(key) {
+        if (!key) return undefined;
+        const normalized = this._normalizeCostKey(key);
+        if (!normalized) return undefined;
+
+        if (Object.prototype.hasOwnProperty.call(this.COSTS, normalized) && Number.isFinite(this.COSTS[normalized])) {
+            return this.COSTS[normalized];
+        }
+
+        if (normalized.startsWith('scores.') && this.COSTS.scores) {
+            const parts = normalized.split('.');
+            const value = this.COSTS.scores?.[parts[1]];
+            if (Number.isFinite(value)) return value;
+        }
+
+        if (normalized.startsWith('scores_') && this.COSTS.scores) {
+            const subKey = normalized.replace('scores_', '');
+            const value = this.COSTS.scores?.[subKey];
+            if (Number.isFinite(value)) return value;
+        }
+
+        const aliasTarget = this.COST_ALIASES?.[normalized];
+        if (aliasTarget) {
+            return this._lookupCostByKey(aliasTarget);
+        }
+
+        if (normalized.includes('.')) {
+            const fallback = normalized.replace(/\./g, '_');
+            if (Number.isFinite(this.COSTS[fallback])) {
+                return this.COSTS[fallback];
+            }
+        }
+
+        return undefined;
+    }
+
+    _tokenizeReason(reason) {
+        const tokens = new Set();
+        const parts = String(reason || '')
+            .toLowerCase()
+            .split(/[^a-z0-9]+/)
+            .filter(Boolean);
+
+        for (const part of parts) {
+            if (part === 'tag' || part === 'tags') {
+                tokens.add('tags');
+            } else if (part === 'score' || part === 'scores') {
+                tokens.add('scores');
+            } else if (part === 'general' || part === 'gen' || part === 'reasoning' || part === 'reason' || part === 'basic') {
+                tokens.add('reasoning');
+            } else if (
+                part === 'accuracy' ||
+                part === 'accurate' ||
+                part === 'price' ||
+                part === 'pricing' ||
+                part === 'priceaccuracy' ||
+                part === 'price_accuracy' ||
+                part === 'timeframe' ||
+                part === 'tf'
+            ) {
+                tokens.add('accuracy');
+            }
+        }
+
+        return tokens;
+    }
+
+    _reasonCostFromTokens(tokens) {
+        if (!tokens || tokens.size === 0) return null;
+
+        const hasTags = tokens.has('tags');
+        const hasScores = tokens.has('scores');
+        const hasReasoning = tokens.has('reasoning');
+        const hasAccuracy = tokens.has('accuracy');
+
+        if (!hasTags && !hasScores && !hasReasoning && !hasAccuracy) return null;
+
+        if (!hasTags && !hasScores && !hasAccuracy && hasReasoning) return this.COSTS.basic;
+
+        if (!hasTags && !hasReasoning && !hasAccuracy && hasScores) return this.COSTS.scores_default;
+
+        if (!hasTags && hasScores && hasReasoning && !hasAccuracy) return this.COSTS.scores_and_basic;
+
+        if (!hasTags && hasScores && hasReasoning && hasAccuracy) return this.COSTS.scores_basic_price_accuracy;
+
+        if (!hasTags && !hasScores && hasReasoning && hasAccuracy) return this.COSTS.basic_and_price_accuracy;
+
+        if (!hasTags && !hasScores && !hasReasoning && hasAccuracy) return this.COSTS.price_accuracy;
+
+        if (hasTags) {
+            if (hasAccuracy && hasReasoning) return this.COSTS.tags_price_accuracy_basic;
+            if (hasAccuracy) return this.COSTS.tags_price_accuracy;
+            if (hasScores && hasReasoning) return this.COSTS.tags_scores_basic;
+            if (hasReasoning) return this.COSTS.basic_and_tags;
+            if (hasScores) return this.COSTS.tags_scores_basic;
+            return this.COSTS.tags;
+        }
+
+        if (hasReasoning && hasAccuracy) return this.COSTS.basic_and_price_accuracy;
+
+        if (hasScores && hasAccuracy) return this.COSTS.scores_basic_price_accuracy;
+
+        return null;
+    }
+
+    _computeReasonCost(reason) {
+        if (!reason) return null;
+        const direct = this._lookupCostByKey(reason);
+        if (Number.isFinite(direct)) return direct;
+        const tokens = this._tokenizeReason(reason);
+        return this._reasonCostFromTokens(tokens);
     }
 
     // Validate user eligibility for credits
