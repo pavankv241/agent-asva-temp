@@ -263,6 +263,62 @@ class MemoryEngagementStore {
   }
 }
 
+class MemoryCreditUsageStore {
+  constructor() {
+    this.debits = [];
+    this.pendingTotals = new Map();
+  }
+
+  async recordDebit(debit) {
+    const normalized = normalizeAddress(debit.address);
+    const entry = {
+      id: debit.id || randomUUID(),
+      address: normalized,
+      cost: Number(debit.cost) || 0,
+      contextHash: debit.contextHash || '',
+      reason: debit.reason || '',
+      status: 'pending',
+      createdAt: Date.now()
+    };
+    this.debits.push(entry);
+    const total = (this.pendingTotals.get(normalized) || 0) + entry.cost;
+    this.pendingTotals.set(normalized, total);
+    return { id: entry.id, pendingTotal: total };
+  }
+
+  async getPendingTotal(address) {
+    const normalized = normalizeAddress(address);
+    return this.pendingTotals.get(normalized) || 0;
+  }
+
+  async fetchPendingDebits() {
+    return this.debits
+      .filter(d => d.status === 'pending')
+      .map(d => ({
+        id: d.id,
+        address: d.address,
+        cost: d.cost,
+        reason: d.reason,
+        contextHash: d.contextHash
+      }));
+  }
+
+  async markDebitsSettled(ids, txHash) {
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    for (const debit of this.debits) {
+      if (debit.status === 'pending' && idSet.has(debit.id)) {
+        debit.status = 'settled';
+        debit.txHash = txHash;
+        const current = this.pendingTotals.get(debit.address) || 0;
+        const next = Math.max(current - debit.cost, 0);
+        if (next === 0) this.pendingTotals.delete(debit.address);
+        else this.pendingTotals.set(debit.address, next);
+      }
+    }
+  }
+}
+
 class MemoryInferenceUsageStore {
   constructor() {
     this.source = 'memory';
@@ -395,6 +451,126 @@ class Neo4jInferenceUsageStore {
     } catch (err) {
       console.error('[Neo4jInferenceUsageStore] Error getting remaining:', err.message);
       return null;
+    } finally {
+      await session.close();
+    }
+  }
+}
+
+class Neo4jCreditUsageStore {
+  constructor(driver) {
+    this.driver = driver;
+  }
+
+  async recordDebit(debit) {
+    const session = this.driver.session();
+    const id = debit.id || randomUUID();
+    try {
+      const result = await session.executeWrite(tx =>
+        tx.run(
+          `
+          MERGE (u:User {address: $address})
+          CREATE (u)-[:HAS_CREDIT_DEBIT]->(d:CreditDebit {
+            id: $id,
+            cost: $cost,
+            contextHash: $contextHash,
+            reason: $reason,
+            status: 'pending',
+            createdAtMs: timestamp()
+          })
+          WITH u
+          MATCH (u)-[:HAS_CREDIT_DEBIT]->(pending:CreditDebit {status:'pending'})
+          RETURN coalesce(sum(pending.cost), 0) AS pendingTotal
+          `,
+          {
+            address: debit.address,
+            id,
+            cost: Number(debit.cost) || 0,
+            contextHash: debit.contextHash || '',
+            reason: debit.reason || ''
+          }
+        )
+      );
+      const record = result.records?.[0];
+      return {
+        id,
+        pendingTotal: Number(record?.get('pendingTotal') || 0)
+      };
+    } catch (err) {
+      console.error('[Neo4jCreditUsageStore] Error recording debit:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async getPendingTotal(address) {
+    const session = this.driver.session();
+    try {
+      const result = await session.executeRead(tx =>
+        tx.run(
+          `
+          MATCH (u:User {address:$address})-[:HAS_CREDIT_DEBIT]->(d:CreditDebit {status:'pending'})
+          RETURN coalesce(sum(d.cost), 0) AS pendingTotal
+          `,
+          { address }
+        )
+      );
+      const record = result.records?.[0];
+      return Number(record?.get('pendingTotal') || 0);
+    } catch (err) {
+      console.error('[Neo4jCreditUsageStore] Error fetching pending total:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async fetchPendingDebits() {
+    const session = this.driver.session();
+    try {
+      const result = await session.executeRead(tx =>
+        tx.run(
+          `
+          MATCH (u:User)-[:HAS_CREDIT_DEBIT]->(d:CreditDebit {status:'pending'})
+          RETURN d.id AS id, u.address AS address, d.cost AS cost, d.reason AS reason, d.contextHash AS contextHash
+          `
+        )
+      );
+      return result.records.map(r => ({
+        id: r.get('id'),
+        address: r.get('address'),
+        cost: Number(r.get('cost') || 0),
+        reason: r.get('reason') || '',
+        contextHash: r.get('contextHash') || ''
+      }));
+    } catch (err) {
+      console.error('[Neo4jCreditUsageStore] Error fetching debits:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async markDebitsSettled(ids, txHash) {
+    if (!ids.length) return;
+    const session = this.driver.session();
+    try {
+      await session.executeWrite(tx =>
+        tx.run(
+          `
+          MATCH (:User)-[:HAS_CREDIT_DEBIT]->(d:CreditDebit)
+          WHERE d.id IN $ids
+          SET d.status = 'settled',
+              d.txHash = $txHash,
+              d.settledAtMs = timestamp()
+          `,
+          { ids, txHash }
+        )
+      );
+    } catch (err) {
+      console.error('[Neo4jCreditUsageStore] Error marking debits settled:', err.message || err);
+      throw err;
     } finally {
       await session.close();
     }
@@ -736,6 +912,15 @@ const inferenceStore = (() => {
   return new MemoryInferenceUsageStore();
 })();
 
+const creditUsageStore = (() => {
+  const driver = getNeo4jDriver();
+  if (driver) {
+    return new Neo4jCreditUsageStore(driver);
+  }
+  console.warn('[credit-usage-store] Neo4j not configured, using in-memory store (non-persistent)');
+  return new MemoryCreditUsageStore();
+})();
+
 function isModeAllowedForPlan(planId, mode) {
   const normalizedMode = String(mode || '').toLowerCase();
   switch (Number(planId)) {
@@ -757,12 +942,15 @@ function isModeAllowedForPlan(planId, mode) {
 }
 
 async function ClearPendingCredits(trigger = 'timer') {
-  const [pendingEngagements, pendingCalculations] = await Promise.all([
+  const [pendingEngagements, pendingCalculations, pendingCreditDebits] = await Promise.all([
     engagementStore.fetchPendingEngagements(),
-    engagementStore.fetchPendingCreditCalculations()
+    engagementStore.fetchPendingCreditCalculations(),
+    creditUsageStore && creditUsageStore.fetchPendingDebits
+      ? creditUsageStore.fetchPendingDebits()
+      : []
   ]);
 
-  if (!pendingEngagements.length && !pendingCalculations.length) {
+  if (!pendingEngagements.length && !pendingCalculations.length && !pendingCreditDebits.length) {
     return { ok: true, trigger, message: 'no pending credits' };
   }
 
@@ -865,6 +1053,43 @@ async function ClearPendingCredits(trigger = 'timer') {
     }
   }
 
+  if (pendingCreditDebits.length) {
+    const groupedDebits = new Map();
+    for (const debit of pendingCreditDebits) {
+      if (!groupedDebits.has(debit.address)) {
+        groupedDebits.set(debit.address, { amount: 0, ids: [] });
+      }
+      const bucket = groupedDebits.get(debit.address);
+      bucket.amount += Number(debit.cost) || 0;
+      bucket.ids.push(debit.id);
+    }
+
+    for (const [address, info] of groupedDebits.entries()) {
+      if (info.amount <= 0) continue;
+      try {
+        const tx = await contract.deductCredits(
+          address,
+          BigInt(info.amount),
+          'inference_cached',
+          ''
+        );
+        const receipt = await tx.wait();
+        txResults.push({
+          type: 'inference_debit',
+          address,
+          totalCredits: info.amount,
+          txHash: receipt.hash
+        });
+        if (creditUsageStore && creditUsageStore.markDebitsSettled) {
+          await creditUsageStore.markDebitsSettled(info.ids, receipt.hash);
+        }
+      } catch (err) {
+        console.error(`[ClearPendingCredits] failed while settling credit debits for ${address}`, err);
+        return { ok: false, trigger, address, message: err.message || 'tx failed' };
+      }
+    }
+  }
+
   return { ok: true, trigger, txResults };
 }
 
@@ -933,7 +1158,7 @@ app.post('/credits/calculate-and-store', async (req, res) => {
 
     const normalizedAddress = normalizeAddress(checksumAddress);
     const credits = getOracle().calculateCredits(reason, Number(parameter));
-    
+
     if (credits <= 0) {
       return res.status(400).json({ error: 'calculated credits must be greater than 0' });
     }
@@ -958,12 +1183,12 @@ app.post('/credits/calculate-and-store', async (req, res) => {
 });
 
 // Estimate inference cost
-// body: { mode: string, quantity?: number }
+// body: { mode: string, quantity?: number, reason?: string }
 app.post('/inference/estimate', (req, res) => {
   try {
-    const { mode, quantity = 1 } = req.body || {};
+    const { mode, quantity = 1, reason } = req.body || {};
     if (typeof mode !== 'string') return res.status(400).json({ error: 'mode required' });
-    const cost = getOracle().getInferenceCost(mode, Number(quantity));
+    const cost = getOracle().getInferenceCost(mode, Number(quantity), reason);
     return res.json(serialize({ cost }));
   } catch (e) {
     return res.status(400).json({ error: e.message });
@@ -1043,6 +1268,52 @@ async function getStoredRemainingInference(address, mode) {
   }
 }
 
+async function getPendingCreditUsage(address) {
+  if (!creditUsageStore) return 0;
+  try {
+    const normalized = normalizeAddress(address);
+    const total = await creditUsageStore.getPendingTotal(normalized);
+    return Number(total) || 0;
+  } catch (err) {
+    console.error('[credit-usage-store] getPendingCreditUsage error:', err.message || err);
+    return 0;
+  }
+}
+
+async function cacheCreditAuthorization({ user, cost, contextHash, reason }) {
+  if (!creditUsageStore) return;
+  const numericCost = Number(cost);
+  if (!Number.isFinite(numericCost) || numericCost <= 0) return;
+  try {
+    const normalized = normalizeAddress(user);
+    await creditUsageStore.recordDebit({
+      address: normalized,
+      cost: numericCost,
+      contextHash: contextHash || '',
+      reason: reason || 'inference_cached'
+    });
+  } catch (err) {
+    console.error('[cacheCreditAuthorization] error:', err.message || err);
+  }
+}
+
+async function recordSubscriptionEarnedCredits({ user, credits, planId }) {
+  if (!engagementStore) return;
+  const amount = Number(credits);
+  if (!Number.isFinite(amount) || amount <= 0) return;
+  try {
+    const normalized = normalizeAddress(user);
+    await engagementStore.recordCalculatedCredits(
+      normalized,
+      'subscription_usage_reward',
+      Number(planId) || 0,
+      amount
+    );
+  } catch (err) {
+    console.error('[recordSubscriptionEarnedCredits] error:', err.message || err);
+  }
+}
+
 async function cacheAuthorizationUsage({
   user,
   mode,
@@ -1075,10 +1346,20 @@ async function cacheAuthorizationUsage({
       const onchainRemaining = await getOracle().getRemainingInference(user, mode);
       baseline = Number(onchainRemaining);
     }
-    
+
     if (!Number.isFinite(baseline)) return;
     const nextRemaining = Math.max(baseline - Number(quantity || 0), 0);
-    
+
+    let earnedCreditsDelta = 0;
+    const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
+    if (planMonthlyCap > 0) {
+      const totalUsedBefore = planMonthlyCap - baseline;
+      const totalUsedAfter = planMonthlyCap - nextRemaining;
+      const creditsBefore = Math.floor(totalUsedBefore / 2);
+      const creditsAfter = Math.floor(totalUsedAfter / 2);
+      earnedCreditsDelta = Math.max(0, creditsAfter - creditsBefore);
+    }
+
     // Keep all allowed modes in sync for this plan so remaining is a single shared pool
     const candidateModes = ['basic', 'tags', 'price_accuracy', 'full'];
     for (const m of candidateModes) {
@@ -1094,96 +1375,24 @@ async function cacheAuthorizationUsage({
         remainingOverride: nextRemaining
       });
     }
+
+    if (earnedCreditsDelta > 0) {
+      await recordSubscriptionEarnedCredits({
+        user,
+        credits: earnedCreditsDelta,
+        planId: currentPlanId
+      });
+    }
   } catch (err) {
     console.error('[cacheAuthorizationUsage] error:', err.message || err);
   }
 }
 
-async function settleInferenceAuthorization({
-  user,
-  mode,
-  quantity,
-  method,
-  cost,
-  contextHash,
-  reason
-}) {
-  const normalizedMode = String(mode || '').toLowerCase();
-  const settlement = {
-    attempted: true,
-    method,
-    status: 'skipped'
-  };
-
-  const signer = getSigner();
-  const contract = getTreasuryContract();
-  if (!signer || !contract) {
-    return {
-      ...settlement,
-      status: 'error',
-      message: 'oracle signer not configured'
-    };
-  }
-
-  try {
-    let tx = null;
-    if (method === 'credits') {
-      if (!Number.isFinite(cost) || cost <= 0) {
-        return { ...settlement, status: 'error', message: 'invalid cost for credit settlement' };
-      }
-      tx = await contract.deductCredits(
-        user,
-        BigInt(cost),
-        reason || `inference_${normalizedMode || 'generic'}`,
-        contextHash || ''
-      );
-    } else if (method === 'subscription') {
-      if (!Number.isFinite(quantity) || quantity <= 0) {
-        return { ...settlement, status: 'error', message: 'invalid quantity for subscription settlement' };
-      }
-      const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
-      tx = await contract.consumeSubscriptionUsage(
-        user,
-        BigInt(Math.trunc(quantity)),
-        isPriceAccuracyMode
-      );
-    } else {
-      return { ...settlement, status: 'skipped', message: `method ${method} does not require settlement` };
-    }
-
-    const receipt = await tx.wait();
-    await recordInferenceUsageSnapshot({
-      user,
-      mode,
-      method,
-      quantity,
-      cost,
-      contextHash,
-      reason,
-      txHash: receipt.hash
-    });
-    return {
-      attempted: true,
-      method,
-      status: 'ok',
-      txHash: receipt.hash
-    };
-  } catch (err) {
-    console.error('[settleInferenceAuthorization] failed', err);
-    return {
-      attempted: true,
-      method,
-      status: 'error',
-      message: err.message || 'settlement tx failed'
-    };
-  }
-}
-
 // Authorization helper (reads on-chain state)
-// body: { user: string, mode?: string, quantity?: number, settle?: boolean, contextHash?: string, reason?: string }
+// body: { user: string, mode?: string, quantity?: number, contextHash?: string, reason?: string }
 app.post('/inference/authorize', async (req, res) => {
   try {
-    const { user, mode, quantity = 1, settle = false, contextHash = '', reason } = req.body || {};
+    const { user, mode, quantity = 1, contextHash = '', reason } = req.body || {};
     const checksumUser = normalizeHexAddress(user);
     if (!checksumUser) return res.status(400).json({ error: 'valid user address required' });
     const numericQuantity = Number(quantity);
@@ -1241,8 +1450,21 @@ app.post('/inference/authorize', async (req, res) => {
       // Continue with on-chain check only if Neo4j fails
     }
 
-    const result = await getOracle().authorizeInference(user, resolvedMode, numericQuantity, pendingUsageFromNeo4j);
-    let settlement = { attempted: false, status: 'skipped' };
+    let pendingCreditsFromNeo4j = 0;
+    try {
+      pendingCreditsFromNeo4j = await getPendingCreditUsage(checksumUser);
+    } catch (err) {
+      console.error('[authorize] Error calculating pending credits from Neo4j:', err.message || err);
+    }
+
+    const result = await getOracle().authorizeInference(
+      user,
+      resolvedMode,
+      numericQuantity,
+      pendingUsageFromNeo4j,
+      pendingCreditsFromNeo4j,
+      reasonValue
+    );
 
     if (result?.allowed && result.method === 'subscription') {
       await cacheAuthorizationUsage({
@@ -1253,18 +1475,9 @@ app.post('/inference/authorize', async (req, res) => {
         contextHash: contextHashValue,
         reason: reasonValue
       });
-    }
-
-    if (
-      settle &&
-      result?.allowed &&
-      (result.method === 'credits' || result.method === 'subscription')
-    ) {
-      settlement = await settleInferenceAuthorization({
+    } else if (result?.allowed && result.method === 'credits') {
+      await cacheCreditAuthorization({
         user: checksumUser,
-        mode: resolvedMode,
-        quantity: numericQuantity,
-        method: result.method,
         cost: result.cost,
         contextHash: contextHashValue,
         reason: reasonValue
@@ -1274,8 +1487,7 @@ app.post('/inference/authorize', async (req, res) => {
     return res.json(serialize({
       ...result,
       mode: resolvedMode,
-      contextHash: contextHashValue,
-      settlement
+      contextHash: contextHashValue
     }));
   } catch (e) {
     return res.status(400).json({ error: e.message });
@@ -1443,9 +1655,20 @@ app.get('/users/:address/summary', async (req, res) => {
     const checksumAddr = normalizeHexAddress(addr);
     if (!checksumAddr) return res.status(400).json({ error: 'invalid address' });
 
-    const [credits, subscription] = await Promise.all([
+    const [credits, subscription, pendingCalculated] = await Promise.all([
       getOracle().getUserCredits(checksumAddr),
-      getOracle().getUserSubscription(checksumAddr)
+      getOracle().getUserSubscription(checksumAddr),
+      (async () => {
+        if (!engagementStore || !engagementStore.getCalculatedCreditsForUser) return 0;
+        try {
+          const normalizedAddress = normalizeAddress(checksumAddr);
+          const data = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
+          return Number(data?.totalCalculatedCredits || 0);
+        } catch (err) {
+          console.error('[summary] error fetching pending calculated credits', err.message || err);
+          return 0;
+        }
+      })()
     ]);
 
     const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
@@ -1517,10 +1740,15 @@ app.get('/users/:address/summary', async (req, res) => {
       }
     }
 
+    const pendingCalculatedCredits = Number(pendingCalculated) || 0;
+    const effectiveCredits = (BigInt(credits) + BigInt(pendingCalculatedCredits)).toString();
+
     return res.json(serialize({
       address: checksumAddr,
       subscription: subscription || {},
       credits,
+      pendingCalculatedCredits: pendingCalculatedCredits.toString(),
+      effectiveCredits,
       inference
     }));
   } catch (e) {
