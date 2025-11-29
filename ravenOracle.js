@@ -176,10 +176,22 @@ class RavenOracle {
         return limited;
     }
 
-    // Read-only authorization decision based on  priorities
+    // Read-only authorization decision based on priorities
     // Returns: { allowed, method: 'subscription'|'credits'|'deny', reason, cost }
     // pendingUsageFromNeo4j: optional pending usage count from Neo4j cache (to prevent exceeding cap before settlement)
-    async authorizeInference(userAddress, mode, quantity = 1, pendingUsageFromNeo4j = 0, pendingCreditsFromNeo4j = 0, reason) {
+    // pendingCreditsFromNeo4j: pending credit debits (off-chain)
+    // pendingCalculatedFromNeo4j: pending calculated credits (grants) (off-chain)
+    // tagsFlag: when true, we force pricing to include 'tags' even if the reason text doesn't contain it
+    async authorizeInference(
+        userAddress,
+        mode,
+        quantity = 1,
+        pendingUsageFromNeo4j = 0,
+        pendingCreditsFromNeo4j = 0,
+        pendingCalculatedFromNeo4j = 0,
+        tagsFlag = false,
+        reason
+    ) {
         // 1) Rate limit
         if (this.isRateLimited(userAddress)) {
             return { allowed: false, method: 'deny', reason: 'rate_limited', cost: 0 };
@@ -189,8 +201,10 @@ class RavenOracle {
         const subscription = await this.getUserSubscription(userAddress);
         const creditsStr = await this.getUserCredits(userAddress);
         const credits = BigInt(creditsStr);
-        const pendingCredits = BigInt(pendingCreditsFromNeo4j || 0);
-        const effectiveCredits = credits > pendingCredits ? credits - pendingCredits : 0n;
+        const pendingCreditDebits = BigInt(pendingCreditsFromNeo4j || 0);
+        const pendingCalculated = BigInt(pendingCalculatedFromNeo4j || 0);
+        const grossCredits = credits + pendingCalculated;
+        const effectiveCredits = grossCredits > pendingCreditDebits ? grossCredits - pendingCreditDebits : 0n;
 
         // 3) Initial one-time 50-credits allowance (process-local guard)
         if (!this._grantedInitial.has(userAddress) && credits === 0n && (!subscription || subscription.planId === 0)) {
@@ -200,7 +214,13 @@ class RavenOracle {
         // 4) Prefer subscription if active
         const isSubscribed = !!subscription && Number(subscription.planId) > 0 && subscription.plan.active;
         const normalizedMode = String(mode || 'basic').toLowerCase();
-        const normalizedReason = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
+        let normalizedReason = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
+        if (tagsFlag) {
+            const hasTagsWord = normalizedReason && /tag/i.test(normalizedReason);
+            if (!hasTagsWord) {
+                normalizedReason = normalizedReason ? `${normalizedReason} tags` : 'tags';
+            }
+        }
         const cost = this.getInferenceCost(normalizedMode, quantity, normalizedReason);
         const isPriceAccuracyMode =
             normalizedMode === 'price_accuracy' ||
@@ -229,7 +249,8 @@ class RavenOracle {
                 cost,
                 creditsAvailable: effectiveCredits.toString(),
                 creditsOnChain: credits.toString(),
-                pendingCredits: pendingCredits.toString()
+                pendingCredits: pendingCreditDebits.toString(),
+                pendingCalculatedCredits: pendingCalculated.toString()
             };
         }
 
@@ -252,7 +273,8 @@ class RavenOracle {
             cost,
             creditsAvailable: effectiveCredits.toString(),
             creditsOnChain: credits.toString(),
-            pendingCredits: pendingCredits.toString()
+            pendingCredits: pendingCreditDebits.toString(),
+            pendingCalculatedCredits: pendingCalculated.toString()
         };
     }
 
