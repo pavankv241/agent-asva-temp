@@ -577,6 +577,81 @@ class Neo4jCreditUsageStore {
   }
 }
 
+class Neo4jReferralStore {
+  constructor(driver) {
+    this.driver = driver;
+  }
+
+  async getOrCreateCode(address) {
+    const session = this.driver.session();
+    try {
+      const result = await session.executeWrite(tx =>
+        tx.run(
+          `
+          MERGE (u:User {address: $address})
+          OPTIONAL MATCH (u)-[:HAS_REFERRAL_CODE]->(existing:ReferralCode)
+          WITH u, existing
+          CALL {
+            WITH u, existing
+            WHERE existing IS NOT NULL
+            RETURN existing.code AS code
+          }
+          UNION
+          CALL {
+            WITH u, existing
+            WHERE existing IS NULL
+            WITH u, apoc.text.random(8, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') AS raw
+            WITH u, 'ASV-' + raw AS code
+            MERGE (u)-[:HAS_REFERRAL_CODE]->(c:ReferralCode {code: code})
+            ON CREATE SET c.createdAtMs = timestamp()
+            RETURN c.code AS code
+          }
+          `,
+          { address }
+        )
+      );
+      const record = result.records?.[0];
+      return record?.get('code');
+    } catch (err) {
+      console.error('[Neo4jReferralStore] getOrCreateCode error:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async redeemCode(code, newUserAddress) {
+    const session = this.driver.session();
+    try {
+      const result = await session.executeWrite(tx =>
+        tx.run(
+          `
+          MATCH (referrer:User)-[:HAS_REFERRAL_CODE]->(c:ReferralCode {code:$code})
+          MERGE (newUser:User {address:$newUser})
+          OPTIONAL MATCH (:User)-[r:REFERRED]->(newUser)
+          WITH referrer, newUser, r
+          WHERE r IS NULL AND referrer.address <> newUser.address
+          MERGE (referrer)-[:REFERRED {createdAtMs:timestamp()}]->(newUser)
+          RETURN referrer.address AS referrer, newUser.address AS referred
+          `,
+          { code, newUser: newUserAddress }
+        )
+      );
+      if (!result.records.length) return null;
+      const rec = result.records[0];
+      return {
+        referrer: rec.get('referrer'),
+        referred: rec.get('referred')
+      };
+    } catch (err) {
+      console.error('[Neo4jReferralStore] redeemCode error:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+}
+
 class Neo4jEngagementStore {
   constructor(driver) {
     this.driver = driver;
@@ -919,6 +994,15 @@ const creditUsageStore = (() => {
   }
   console.warn('[credit-usage-store] Neo4j not configured, using in-memory store (non-persistent)');
   return new MemoryCreditUsageStore();
+})();
+
+const referralStore = (() => {
+  const driver = getNeo4jDriver();
+  if (driver) {
+    return new Neo4jReferralStore(driver);
+  }
+  console.warn('[referral-store] Neo4j not configured; referral codes will not persist');
+  return null;
 })();
 
 function isModeAllowedForPlan(planId, mode) {
@@ -1348,11 +1432,11 @@ async function cacheAuthorizationUsage({
         baseline = planMonthlyCap;
       } else {
         // Fallback to on-chain if no plan
-        const onchainRemaining = await getOracle().getRemainingInference(user, mode);
-        baseline = Number(onchainRemaining);
+      const onchainRemaining = await getOracle().getRemainingInference(user, mode);
+      baseline = Number(onchainRemaining);
       }
     }
-
+    
     if (!Number.isFinite(baseline)) return;
     const nextRemaining = Math.max(baseline - Number(quantity || 0), 0);
 
@@ -1365,7 +1449,7 @@ async function cacheAuthorizationUsage({
       const creditsAfter = Math.floor(totalUsedAfter / 2);
       earnedCreditsDelta = Math.max(0, creditsAfter - creditsBefore);
     }
-
+    
     // Keep all allowed modes in sync for this plan so remaining is a single shared pool
     const snapshotModes = ['basic', 'tags', 'price_accuracy', 'full', 'general'];
     for (const m of snapshotModes) {
@@ -1379,11 +1463,11 @@ async function cacheAuthorizationUsage({
         reason,
         remainingOverride: nextRemaining
       });
-    }
+}
 
     if (earnedCreditsDelta > 0) {
       await recordSubscriptionEarnedCredits({
-        user,
+  user,
         credits: earnedCreditsDelta,
         planId: currentPlanId
       });
@@ -1394,10 +1478,10 @@ async function cacheAuthorizationUsage({
 }
 
 // Authorization helper (reads on-chain state)
-// body: { user: string, mode?: string, quantity?: number, contextHash?: string, reason?: string }
+// body: { user: string, mode?: string, quantity?: number, contextHash?: string, reason?: string, tags?: boolean }
 app.post('/inference/authorize', async (req, res) => {
   try {
-    const { user, mode, quantity = 1, contextHash = '', reason } = req.body || {};
+    const { user, mode, quantity = 1, contextHash = '', reason, tags } = req.body || {};
     const checksumUser = normalizeHexAddress(user);
     if (!checksumUser) return res.status(400).json({ error: 'valid user address required' });
     const numericQuantity = Number(quantity);
@@ -1406,6 +1490,7 @@ app.post('/inference/authorize', async (req, res) => {
     }
     const contextHashValue = typeof contextHash === 'string' ? contextHash : '';
     const reasonValue = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
+    const tagsFlag = Boolean(tags);
     let resolvedMode = (typeof mode === 'string' && mode.length > 0) ? mode : null;
     if (!resolvedMode) {
       resolvedMode = 'basic';
@@ -1447,12 +1532,25 @@ app.post('/inference/authorize', async (req, res) => {
       console.error('[authorize] Error calculating pending credits from Neo4j:', err.message || err);
     }
 
+    let pendingCalculatedFromNeo4j = 0;
+    try {
+      if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
+        const normalizedAddress = normalizeAddress(checksumUser);
+        const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
+        pendingCalculatedFromNeo4j = Number(calculated?.totalCalculatedCredits || 0);
+      }
+    } catch (err) {
+      console.error('[authorize] Error calculating pending calculated credits from Neo4j:', err.message || err);
+    }
+
     const result = await getOracle().authorizeInference(
       user,
       resolvedMode,
       numericQuantity,
       pendingUsageFromNeo4j,
       pendingCreditsFromNeo4j,
+      pendingCalculatedFromNeo4j,
+      tagsFlag,
       reasonValue
     );
 
@@ -1719,16 +1817,16 @@ app.get('/users/:address/summary', async (req, res) => {
           try {
             const snapshotModes = ['basic', 'tags', 'price_accuracy', 'full', 'general'];
             for (const m of snapshotModes) {
-              await recordInferenceUsageSnapshot({
-                user: checksumAddr,
+            await recordInferenceUsageSnapshot({
+              user: checksumAddr,
                 mode: m,
-                method: 'subscription',
-                quantity: 0,
-                cost: 0,
-                contextHash: '',
-                reason: planChanged ? 'plan_changed' : 'subscription_renewed',
-                remainingOverride: Number(remaining)
-              });
+              method: 'subscription',
+              quantity: 0,
+              cost: 0,
+              contextHash: '',
+              reason: planChanged ? 'plan_changed' : 'subscription_renewed',
+              remainingOverride: Number(remaining)
+            });
             }
           } catch (err) {
             console.error('[summary] failed to refresh cache after plan change/renewal', err);
@@ -1738,15 +1836,118 @@ app.get('/users/:address/summary', async (req, res) => {
     }
 
     const pendingCalculatedCredits = Number(pendingCalculated) || 0;
-    const effectiveCredits = (BigInt(credits) + BigInt(pendingCalculatedCredits)).toString();
+    let pendingCreditDebits = 0;
+    try {
+      pendingCreditDebits = await getPendingCreditUsage(checksumAddr);
+    } catch (err) {
+      console.error('[summary] error fetching pending credit debits', err.message || err);
+    }
+    let effectiveCreditsBig = BigInt(credits) + BigInt(pendingCalculatedCredits) - BigInt(pendingCreditDebits);
+    if (effectiveCreditsBig < 0n) effectiveCreditsBig = 0n;
+    const effectiveCredits = effectiveCreditsBig.toString();
 
     return res.json(serialize({
       address: checksumAddr,
       subscription: subscription || {},
       credits,
       pendingCalculatedCredits: pendingCalculatedCredits.toString(),
+      pendingCreditDebits: pendingCreditDebits.toString(),
       effectiveCredits,
       inference
+    }));
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Generate or fetch referral code for a user
+app.post('/referral/code', async (req, res) => {
+  try {
+    const { address } = req.body || {};
+    const checksumAddr = normalizeHexAddress(address);
+    if (!checksumAddr) return res.status(400).json({ error: 'valid address required' });
+    if (!referralStore) return res.status(500).json({ error: 'referral store not configured' });
+
+    const code = await referralStore.getOrCreateCode(normalizeAddress(checksumAddr));
+    if (!code) return res.status(500).json({ error: 'failed to generate referral code' });
+    return res.json(serialize({ address: checksumAddr, code }));
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Redeem a referral code for a new user, crediting both referrer and referred via engagement pipeline
+app.post('/referral/redeem', async (req, res) => {
+  try {
+    const { code, newUser } = req.body || {};
+    if (typeof code !== 'string' || !code.trim()) {
+      return res.status(400).json({ error: 'code required' });
+    }
+    const checksumNewUser = normalizeHexAddress(newUser);
+    if (!checksumNewUser) return res.status(400).json({ error: 'valid newUser address required' });
+    if (!referralStore) return res.status(500).json({ error: 'referral store not configured' });
+
+    const normalizedNew = normalizeAddress(checksumNewUser);
+    const mapping = await referralStore.redeemCode(code.trim(), normalizedNew);
+    if (!mapping) {
+      return res.status(400).json({ error: 'invalid_code_or_already_referred' });
+    }
+
+    const referrerAddr = mapping.referrer;
+    const referredAddr = mapping.referred;
+
+    if (referrerAddr.toLowerCase() === referredAddr.toLowerCase()) {
+      return res.status(400).json({ error: 'self_referral_not_allowed' });
+    }
+
+    const oracle = getOracle();
+    const refCredits = oracle.getActionCredit('referral_you_refer') || 0;
+    const referredCredits = oracle.getActionCredit('referral_you_are_referred') || 0;
+
+    if (refCredits <= 0 || referredCredits <= 0) {
+      return res.status(500).json({ error: 'referral actions not configured' });
+    }
+
+    const now = Date.now();
+
+    const refEngagement = {
+      id: randomUUID(),
+      address: normalizeAddress(referrerAddr),
+      action: 'referral_you_refer',
+      credits: refCredits,
+      xp: refCredits * 2,
+      metadata: { referred: referredAddr, code: code.trim() },
+      createdAt: now
+    };
+
+    const newEngagement = {
+      id: randomUUID(),
+      address: normalizeAddress(referredAddr),
+      action: 'referral_you_are_referred',
+      credits: referredCredits,
+      xp: referredCredits * 2,
+      metadata: { referrer: referrerAddr, code: code.trim() },
+      createdAt: now
+    };
+
+    const [refResult, newResult] = await Promise.all([
+      engagementStore.recordEngagement(refEngagement),
+      engagementStore.recordEngagement(newEngagement)
+    ]);
+
+    return res.json(serialize({
+      referrer: {
+        address: refEngagement.address,
+        credits: refEngagement.credits,
+        xp: refEngagement.xp,
+        pendingCredits: refResult.pendingCredits
+      },
+      referred: {
+        address: newEngagement.address,
+        credits: newEngagement.credits,
+        xp: newEngagement.xp,
+        pendingCredits: newResult.pendingCredits
+      }
     }));
   } catch (e) {
     return res.status(500).json({ error: e.message });
