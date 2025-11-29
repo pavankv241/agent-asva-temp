@@ -6,9 +6,10 @@ This Express API:
 - Tracks off-chain engagement events in Neo4j (likes, referrals, etc.)
 - Tracks calculated credits in Neo4j (social_quest, prompt_streak, referral, ai_inference)
 - Automatically awards XP (Experience Points) for engagement actions (XP = Credits * 2)
+- Manages referral codes and referral relationships in Neo4j
 - Exposes endpoints for inference estimation/authorization
 - Lets the UI show "pending credits" immediately (from Neo4j) while confirmed credits come from the contract/subgraph
-- Automatically batches pending credits (both engagement and calculated) via `awardCreditsBatch` on a schedule (or manually)
+- Automatically batches pending credits (both engagement and calculated) via `awardCreditsBatch` on a schedule (with an optional manual batch endpoint for admins)
 
 ## Endpoints (frontend + oracle usage)
 
@@ -27,6 +28,7 @@ const data = await res.json(); // { status: 'ok' }
 - Body params (JSON):
   - `mode` (string): one of `basic | tags | price_accuracy | full`
   - `quantity` (number, optional, default 1)
+  - `reason` (string, optional): descriptive label for the requested combination (e.g. `tags_accuracy`, `scores_reasoning_accuracy`). When provided, it overrides the default mode-based pricing.
 - Frontend :
 ```js
 const res = await fetch('/inference/estimate', {
@@ -37,17 +39,19 @@ const { cost } = await res.json();
 ```
 
 ### POST `/inference/authorize`
-- read-only check to decide if a user can run an inference now, and whether it would bill subscription or credits.
+- Read-mostly helper to decide if a user can run an inference now, and whether it would bill subscription or credits. Also updates Neo4j with the decremented remaining quota for the user's plan (shared pool across allowed modes) and off‑chain credit usage.
 - Body params (JSON):
   - `user` (string, 0x-address)
-  - `mode` (string): `basic | tags | price_accuracy | full`
+  - `mode` (string, optional): `basic | tags | price_accuracy | full` (defaults to `basic` if omitted)
   - `quantity` (number, optional, default 1)
-- Returns: `{ allowed, method: 'subscription'|'credits'|'initial_grant'|'deny', reason, cost }`
+  - `reason` (string, optional): same as in `/inference/estimate`; used to determine the precise credit cost if/when the request falls back to credits.
+  - `tags` (boolean, optional): when `true`, forces pricing to include tags even if the free‑text `reason` doesn’t explicitly contain the word “tags`.
+- Returns: `{ allowed, method: 'subscription'|'credits'|'initial_grant'|'deny', reason, cost, ... }`
 - Frontend :
 ```js
 const res = await fetch('/inference/authorize', {
   method: 'POST', headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ user, mode: 'full', quantity: 1 })
+  body: JSON.stringify({ user, reason: 'tags_price_accuracy_basic', tags: true })
 });
 const decision = await res.json();
 ```
@@ -92,22 +96,6 @@ const data = await res.json(); // { address, totalCalculatedCredits }
 ```js
 const res = await fetch(`/users/${user}/subscription`);
 const sub = await res.json();
-```
-
-### GET `/users/:address/inference/remaining`
-- Purpose: get remaining inference count for a user based on subscription and mode. Calculated off-chain with window reset logic applied.
-- Query params:
-  - `mode` (string, required): one of `basic | tags | price_accuracy | full`
-- Response: `{ address, mode, remaining }` where `remaining` is the number of inferences available in the current 30-day window
-- Notes:
-  - Returns `0` if user has no active subscription
-  - Applies 30-day window reset logic automatically
-  - For `price_accuracy` and `full` modes, uses global cap of 3000 (regardless of plan)
-  - For other modes, uses the plan's monthly cap
-- Frontend :
-```js
-const res = await fetch(`/users/${user}/inference/remaining?mode=price_accuracy`);
-const data = await res.json(); // { address, mode: 'price_accuracy', remaining: '2500' }
 ```
 
 ### GET `/users/:address/has-active-subscription`
@@ -189,30 +177,40 @@ const res = await fetch('/engagement', {
 const data = await res.json(); // { engagementId, address, action, credits, xp, pendingCredits }
 ```
 
-### POST `/credits/initial-grant`  (Only oracle/owner)
-- Purpose: prepare calldata for a one-time initial credit grant (50 credits) when the user has no credits and no active subscription.
+### POST `/referral/code`
+- Purpose: generate (or fetch) a short referral code for a given user address, stored in Neo4j.
+- Body params (JSON):
+  - `address` (string, 0x-address)
+- Response: `{ address, code }`
+- The frontend can build referral links like: `https://yourapp.xyz/?rc=<code>`.
+
+### POST `/referral/redeem`
+- Purpose: redeem a referral code when a new user signs up. This creates a `REFERRED` relationship in Neo4j and credits both the referrer and the new user via the engagement pipeline (`referral_you_refer` and `referral_you_are_referred` actions).
+- Body params (JSON):
+  - `code` (string): referral code (e.g. `ASV-3F9K2`)
+  - `newUser` (string, 0x-address): wallet of the user who is joining with this code
+- Response:
+  - On success: 
+    ```json
+    {
+      "referrer": { "address": "...", "credits": 15, "xp": 30, "pendingCredits": 15 },
+      "referred": { "address": "...", "credits": 5, "xp": 10, "pendingCredits": 5 }
+    }
+    ```
+  - On error: `{ error: "invalid_code_or_already_referred" | "self_referral_not_allowed" | ... }`
+
+### POST `/credits/initial-grant`  (Only oracle/owner or trusted backend)
+- Purpose: record a one-time initial credit grant (50 credits) when the user has no credits and no active subscription. The grant is stored as a pending calculated credit in Neo4j and immediately counted towards the user’s effective credits for `/inference/authorize` (even before on-chain settlement).
 - Body params (JSON):
   - `user` (string, 0x-address)
-- Response: `{ to, data }` for the on-chain call.
-- Frontend :
-```js
-const resp = await fetch('/credits/initial-grant', {
-  method: 'POST', headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ user })
-});
-const { to, data } = await resp.json();
-const provider = new ethers.BrowserProvider(window.ethereum);
-const signer = await provider.getSigner(); // must be oracle or owner()
-const tx = await signer.sendTransaction({ to, data });
-await tx.wait();
-```
+- Response: `{ status: 'ok', cached: true }` on success, or `{ error }` if the user is not eligible.
 
 ### GET `/credits/pending`
 - Purpose: diagnostic snapshot of all addresses with outstanding pending credits and their engagement events.
 - Response: `{ pendingCredits: [{ address, credits }], pendingEngagements: [...] }`
 
 ### POST `/credits/settle`  (Requires oracle signer)
-- Purpose: force an immediate settlement batch (instead of waiting for the hourly timer).
+- Purpose: force an immediate settlement batch. In normal operation you do **not** need to call this; the server will run the batch automatically every `BATCH_INTERVAL_MS` (e.g. hourly) as long as `ORACLE_PRIVATE_KEY` is configured. This endpoint is mainly for admin/debug tools.
 - Processes both engagement credits and calculated credits:
   - Fetches all pending engagements (like, comment, repost, yap, etc.)
   - Fetches all pending credit calculations (social_quest, prompt_streak, referral, ai_inference)
@@ -243,6 +241,11 @@ const result = await res.json();
 
 **Note**: XP is only awarded for engagement actions, not for calculated credits (social_quest, prompt_streak, etc.).
 
+### Subscription Usage Rewards
+- Every 2 successful inference calls billed to an active subscription grant 1 credit (e.g., consuming an entire 3000-request plan yields 1500 credits).
+- These credits are tracked off-chain immediately, surface via `/users/:address/summary` as `pendingCalculatedCredits`, and count toward the reported `effectiveCredits`.
+- Pending subscription rewards are batch-settled on-chain together with other calculated credits, so the contract balance eventually matches the effective view.
+
 ## Credit Flow
 
 The system tracks two types of credits that are stored in Neo4j and eventually settled on-chain:
@@ -258,7 +261,7 @@ The system tracks two types of credits that are stored in Neo4j and eventually s
 - **Endpoint**: `POST /credits/calculate-and-store`
 - **Reasons**: `social_quest`, `prompt_streak`, `referral`, `ai_inference`
 - **Storage**: Stored as `CreditCalculation` nodes in Neo4j with status `'pending'`
-- **Credits**: Calculated via `calculateCredits(reason, parameter)` function
+- **Credits**: Calculated via `calculateCredits(reason, parameter)` function. Pending calculated credits immediately contribute to `effectiveCredits` and can be spent by `/inference/authorize` even before they are minted on-chain.
 - **XP**: Not awarded for calculated credits (only for engagement actions)
 
 ### XP System
