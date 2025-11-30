@@ -633,6 +633,7 @@ class Neo4jReferralStore {
           `
           MATCH (referrer:User)-[:HAS_REFERRAL_CODE]->(c:ReferralCode {code:$code})
           MERGE (newUser:User {address:$newUser})
+          WITH referrer, newUser
           OPTIONAL MATCH (:User)-[r:REFERRED]->(newUser)
           WITH referrer, newUser, r
           WHERE r IS NULL AND referrer.address <> newUser.address
