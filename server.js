@@ -1999,7 +1999,34 @@ app.post('/credits/initial-grant', async (req, res) => {
       return res.status(400).json({ error: 'not eligible (has credits or active subscription)' });
     }
 
+    // Check if user already received initial grant in Neo4j (pending or settled)
     const normalized = normalizeAddress(checksumUser);
+    if (engagementStore && engagementStore.driver) {
+      const session = engagementStore.driver.session();
+      try {
+        const existingGrantResult = await session.executeRead(tx =>
+          tx.run(
+            `
+            MATCH (u:User {address: $address})-[:HAS_CREDIT_CALCULATION]->(c:CreditCalculation)
+            WHERE c.reason = 'initial_grant'
+            RETURN count(c) AS count
+            `,
+            { address: normalized }
+          )
+        );
+        const existingCount = existingGrantResult.records[0]?.get('count') || 0;
+        if (existingCount > 0) {
+          console.log(`[initial-grant] initial grant already received for ${normalized}`);
+          return res.json(serialize({ status: 'ok', message: 'initial grant already received', cached: true }));
+        }
+      } catch (err) {
+        console.error('[initial-grant] Error checking existing grant:', err.message || err);
+        // Continue to grant if check fails (fail open)
+      } finally {
+        await session.close();
+      }
+    }
+
     await recordSubscriptionEarnedCredits({
       user: normalized,
       credits: 50,
