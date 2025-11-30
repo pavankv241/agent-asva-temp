@@ -585,32 +585,37 @@ class Neo4jReferralStore {
   async getOrCreateCode(address) {
     const session = this.driver.session();
     try {
-      const result = await session.executeWrite(tx =>
+      // First, check if code already exists
+      const checkResult = await session.executeRead(tx =>
         tx.run(
           `
-          MERGE (u:User {address: $address})
-          OPTIONAL MATCH (u)-[:HAS_REFERRAL_CODE]->(existing:ReferralCode)
-          WITH u, existing
-          CALL {
-            WITH u, existing
-            WHERE existing IS NOT NULL
-            RETURN existing.code AS code
-          }
-          UNION
-          CALL {
-            WITH u, existing
-            WHERE existing IS NULL
-            WITH u, apoc.text.random(8, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') AS raw
-            WITH u, 'ASV-' + raw AS code
-            MERGE (u)-[:HAS_REFERRAL_CODE]->(c:ReferralCode {code: code})
-            ON CREATE SET c.createdAtMs = timestamp()
-            RETURN c.code AS code
-          }
+          MATCH (u:User {address: $address})-[:HAS_REFERRAL_CODE]->(c:ReferralCode)
+          RETURN c.code AS code
           `,
           { address }
         )
       );
-      const record = result.records?.[0];
+      
+      if (checkResult.records.length > 0) {
+        return checkResult.records[0].get('code');
+      }
+      
+      // Code doesn't exist, create a new one
+      const createResult = await session.executeWrite(tx =>
+        tx.run(
+          `
+          MERGE (u:User {address: $address})
+          WITH u, apoc.text.random(8, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') AS raw
+          WITH u, 'ASV-' + raw AS code
+          MERGE (u)-[:HAS_REFERRAL_CODE]->(c:ReferralCode {code: code})
+          ON CREATE SET c.createdAtMs = timestamp()
+          RETURN c.code AS code
+          `,
+          { address }
+        )
+      );
+      
+      const record = createResult.records?.[0];
       return record?.get('code');
     } catch (err) {
       console.error('[Neo4jReferralStore] getOrCreateCode error:', err.message || err);
