@@ -1370,6 +1370,18 @@ async function getPendingCreditUsage(address) {
   }
 }
 
+async function getPendingEngagementCredits(address) {
+  if (!engagementStore || !engagementStore.getPendingForUser) return 0;
+  try {
+    const normalized = normalizeAddress(address);
+    const pending = await engagementStore.getPendingForUser(normalized);
+    return Number(pending?.pendingCredits || 0);
+  } catch (err) {
+    console.error('[engagement-store] getPendingEngagementCredits error:', err.message || err);
+    return 0;
+  }
+}
+
 async function cacheCreditAuthorization({ user, cost, contextHash, reason }) {
   if (!creditUsageStore) return;
   const numericCost = Number(cost);
@@ -1538,6 +1550,13 @@ app.post('/inference/authorize', async (req, res) => {
       console.error('[authorize] Error calculating pending credits from Neo4j:', err.message || err);
     }
 
+    let pendingEngagementFromNeo4j = 0;
+    try {
+      pendingEngagementFromNeo4j = await getPendingEngagementCredits(checksumUser);
+    } catch (err) {
+      console.error('[authorize] Error calculating pending engagement credits from Neo4j:', err.message || err);
+    }
+
     let pendingCalculatedFromNeo4j = 0;
     try {
       if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
@@ -1556,6 +1575,7 @@ app.post('/inference/authorize', async (req, res) => {
       pendingUsageFromNeo4j,
       pendingCreditsFromNeo4j,
       pendingCalculatedFromNeo4j,
+      pendingEngagementFromNeo4j,
       tagsFlag,
       reasonValue
     );
@@ -1749,7 +1769,7 @@ app.get('/users/:address/summary', async (req, res) => {
     const checksumAddr = normalizeHexAddress(addr);
     if (!checksumAddr) return res.status(400).json({ error: 'invalid address' });
 
-    const [credits, subscription, pendingCalculated] = await Promise.all([
+    const [credits, subscription, pendingCalculated, pendingEngagement] = await Promise.all([
       getOracle().getUserCredits(checksumAddr),
       getOracle().getUserSubscription(checksumAddr),
       (async () => {
@@ -1762,7 +1782,8 @@ app.get('/users/:address/summary', async (req, res) => {
           console.error('[summary] error fetching pending calculated credits', err.message || err);
           return 0;
         }
-      })()
+      })(),
+      getPendingEngagementCredits(checksumAddr)
     ]);
 
     const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
@@ -1848,7 +1869,12 @@ app.get('/users/:address/summary', async (req, res) => {
     } catch (err) {
       console.error('[summary] error fetching pending credit debits', err.message || err);
     }
-    let effectiveCreditsBig = BigInt(credits) + BigInt(pendingCalculatedCredits) - BigInt(pendingCreditDebits);
+    const pendingEngagementCredits = Number(pendingEngagement) || 0;
+    let effectiveCreditsBig =
+      BigInt(credits) +
+      BigInt(pendingCalculatedCredits) +
+      BigInt(pendingEngagementCredits) -
+      BigInt(pendingCreditDebits);
     if (effectiveCreditsBig < 0n) effectiveCreditsBig = 0n;
     const effectiveCredits = effectiveCreditsBig.toString();
 
@@ -1858,6 +1884,7 @@ app.get('/users/:address/summary', async (req, res) => {
       credits,
       pendingCalculatedCredits: pendingCalculatedCredits.toString(),
       pendingCreditDebits: pendingCreditDebits.toString(),
+      pendingEngagementCredits: pendingEngagementCredits.toString(),
       effectiveCredits,
       inference
     }));
