@@ -2023,7 +2023,14 @@ app.post('/credits/initial-grant', async (req, res) => {
     const hasCredits = BigInt(creditsStr) > 0n;
     const isSubscribed = !!subscription && Number(subscription.planId) > 0 && subscription.plan.active;
     if (hasCredits || isSubscribed) {
-      return res.status(400).json({ error: 'not eligible (has credits or active subscription)' });
+      console.log(
+        `[initial-grant] not eligible for initial grant (hasCredits=${hasCredits}, isSubscribed=${isSubscribed}) for ${checksumUser}`
+      );
+      return res.json(serialize({
+        status: 'ok',
+        message: 'not eligible (has credits or active subscription)',
+        cached: true
+      }));
     }
 
     // Check if user already received initial grant in Neo4j (pending or settled)
