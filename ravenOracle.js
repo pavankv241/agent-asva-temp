@@ -181,6 +181,7 @@ class RavenOracle {
     // pendingUsageFromNeo4j: optional pending usage count from Neo4j cache (to prevent exceeding cap before settlement)
     // pendingCreditsFromNeo4j: pending credit debits (off-chain)
     // pendingCalculatedFromNeo4j: pending calculated credits (grants) (off-chain)
+    // pendingEngagementFromNeo4j: pending engagement credits (likes/referrals/etc.) (off-chain)
     // tagsFlag: when true, we force pricing to include 'tags' even if the reason text doesn't contain it
     async authorizeInference(
         userAddress,
@@ -189,6 +190,7 @@ class RavenOracle {
         pendingUsageFromNeo4j = 0,
         pendingCreditsFromNeo4j = 0,
         pendingCalculatedFromNeo4j = 0,
+        pendingEngagementFromNeo4j = 0,
         tagsFlag = false,
         reason
     ) {
@@ -203,7 +205,8 @@ class RavenOracle {
         const credits = BigInt(creditsStr);
         const pendingCreditDebits = BigInt(pendingCreditsFromNeo4j || 0);
         const pendingCalculated = BigInt(pendingCalculatedFromNeo4j || 0);
-        const grossCredits = credits + pendingCalculated;
+        const pendingEngagement = BigInt(pendingEngagementFromNeo4j || 0);
+        const grossCredits = credits + pendingCalculated + pendingEngagement;
         const effectiveCredits = grossCredits > pendingCreditDebits ? grossCredits - pendingCreditDebits : 0n;
 
         // 3) Initial one-time 50-credits allowance (process-local guard)
@@ -250,7 +253,8 @@ class RavenOracle {
                 creditsAvailable: effectiveCredits.toString(),
                 creditsOnChain: credits.toString(),
                 pendingCredits: pendingCreditDebits.toString(),
-                pendingCalculatedCredits: pendingCalculated.toString()
+                pendingCalculatedCredits: pendingCalculated.toString(),
+                pendingEngagementCredits: pendingEngagement.toString()
             };
         }
 
@@ -274,7 +278,8 @@ class RavenOracle {
             creditsAvailable: effectiveCredits.toString(),
             creditsOnChain: credits.toString(),
             pendingCredits: pendingCreditDebits.toString(),
-            pendingCalculatedCredits: pendingCalculated.toString()
+            pendingCalculatedCredits: pendingCalculated.toString(),
+            pendingEngagementCredits: pendingEngagement.toString()
         };
     }
 
