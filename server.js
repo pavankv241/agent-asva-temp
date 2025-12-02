@@ -582,6 +582,60 @@ class Neo4jReferralStore {
     this.driver = driver;
   }
 
+  async allowReferrals(referrerAddress, allowedAddresses) {
+    if (!Array.isArray(allowedAddresses) || !allowedAddresses.length) return { updated: 0 };
+    const session = this.driver.session();
+    try {
+      const lowerRef = referrerAddress.toLowerCase();
+      const uniqueAllowed = [...new Set(allowedAddresses.map(a => String(a || '').toLowerCase()).filter(Boolean))];
+      if (!uniqueAllowed.length) return { updated: 0 };
+
+      const result = await session.executeWrite(tx =>
+        tx.run(
+          `
+          MERGE (ref:User {address:$referrer})
+          WITH ref
+          UNWIND $allowed AS addr
+          MERGE (u:User {address: addr})
+          MERGE (ref)-[:ALLOWS_REFERRAL]->(u)
+          RETURN count(u) AS updated
+          `,
+          { referrer: lowerRef, allowed: uniqueAllowed }
+        )
+      );
+      const updated = Number(result.records?.[0]?.get('updated') || 0);
+      return { updated };
+    } catch (err) {
+      console.error('[Neo4jReferralStore] allowReferrals error:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async isAllowedReferral(referrerAddress, candidateAddress) {
+    const session = this.driver.session();
+    try {
+      const result = await session.executeRead(tx =>
+        tx.run(
+          `
+          MATCH (ref:User {address:$referrer})-[:ALLOWS_REFERRAL]->(u:User {address:$candidate})
+          RETURN count(u) AS cnt
+          `,
+          { referrer: referrerAddress.toLowerCase(), candidate: candidateAddress.toLowerCase() }
+        )
+      );
+      const cnt = Number(result.records?.[0]?.get('cnt') || 0);
+      return cnt > 0;
+    } catch (err) {
+      console.error('[Neo4jReferralStore] isAllowedReferral error:', err.message || err);
+      // Fail closed: if check fails, treat as not allowed
+      return false;
+    } finally {
+      await session.close();
+    }
+  }
+
   async getOrCreateCode(address) {
     const session = this.driver.session();
     try {
@@ -1912,7 +1966,7 @@ app.post('/referral/code', async (req, res) => {
 // Redeem a referral code for a new user, crediting both referrer and referred via engagement pipeline
 app.post('/referral/redeem', async (req, res) => {
   try {
-    const { code, newUser } = req.body || {};
+      const { code, newUser } = req.body || {};
     if (typeof code !== 'string' || !code.trim()) {
       return res.status(400).json({ error: 'code required' });
     }
@@ -1925,13 +1979,18 @@ app.post('/referral/redeem', async (req, res) => {
     if (!mapping) {
       return res.status(400).json({ error: 'invalid_code_or_already_referred' });
     }
-
     const referrerAddr = mapping.referrer;
     const referredAddr = mapping.referred;
 
     if (referrerAddr.toLowerCase() === referredAddr.toLowerCase()) {
       return res.status(400).json({ error: 'self_referral_not_allowed' });
     }
+
+      // Enforce referrer allow-list: referrer must have explicitly allowed this new user
+      const isAllowed = await referralStore.isAllowedReferral(referrerAddr, normalizedNew);
+      if (!isAllowed) {
+        return res.status(400).json({ error: 'referral_not_allowed_by_referrer' });
+      }
 
     const oracle = getOracle();
     const refCredits = oracle.getActionCredit('referral_you_refer') || 0;
@@ -1986,6 +2045,38 @@ app.post('/referral/redeem', async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 });
+
+  // Allow-list specific addresses that a user (referrer) permits as referrals
+  // body: { referrer: string, allowed: string[] }
+  app.post('/referral/allow', async (req, res) => {
+    try {
+      const { referrer, allowed } = req.body || {};
+      const checksumRef = normalizeHexAddress(referrer);
+      if (!checksumRef) return res.status(400).json({ error: 'valid referrer address required' });
+      if (!Array.isArray(allowed) || !allowed.length) {
+        return res.status(400).json({ error: 'allowed must be non-empty array of addresses' });
+      }
+      if (!referralStore) return res.status(500).json({ error: 'referral store not configured' });
+
+      const normalizedRef = normalizeAddress(checksumRef);
+      const normalizedAllowed = allowed
+        .map(a => normalizeHexAddress(a))
+        .filter(Boolean)
+        .map(a => normalizeAddress(a));
+      if (!normalizedAllowed.length) {
+        return res.status(400).json({ error: 'no valid addresses in allowed list' });
+      }
+
+      const { updated } = await referralStore.allowReferrals(normalizedRef, normalizedAllowed);
+      return res.json(serialize({
+        referrer: checksumRef,
+        updated,
+        allowed: normalizedAllowed
+      }));
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
 
 // Check if a user has an active subscription (boolean)
 app.get('/users/:address/has-active-subscription', async (req, res) => {
