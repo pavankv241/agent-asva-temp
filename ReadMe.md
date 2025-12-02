@@ -204,7 +204,9 @@ const res = await fetch('/referral/allow', {
     allowed: ['0xFriendB...', '0xFriendC...']
   })
 });
-const data = await res.json(); // { referrer, updated, allowed }### POST `/referral/redeem`
+const data = await res.json(); // { referrer, updated, allowed }
+
+### POST `/referral/redeem`
 - Purpose: redeem a referral code when a new user signs up. This creates a `REFERRED` relationship in Neo4j and credits both the referrer and the new user via the engagement pipeline (`referral_you_refer` and `referral_you_are_referred` actions).
 - Body params (JSON):
   - `code` (string): referral code (e.g. `ASV-3F9K2`)
