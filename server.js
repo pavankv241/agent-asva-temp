@@ -3,6 +3,7 @@ const express = require('express');
 const { ethers } = require('ethers');
 const { randomUUID } = require('crypto');
 const neo4j = require('neo4j-driver');
+const { google } = require('googleapis');
 const RavenOracle = require('./ravenOracle');
 
 const app = express();
@@ -35,6 +36,11 @@ const BATCH_INTERVAL_MS = Number(process.env.BATCH_INTERVAL_MS || 60 * 60 * 1000
 const NEO4J_URI = process.env.NEO4J_URI || process.env.NEO4J_URL || 'neo4j://localhost:7687';
 const NEO4J_USERNAME = process.env.NEO4J_USERNAME || process.env.NEO4J_USER || 'neo4j';
 const NEO4J_PASSWORD = process.env.NEO4J_PASSWORD || null;
+const PROTOCOL_INVITE_SECRET = process.env.PROTOCOL_INVITE_SECRET || null;
+const SHEETS_SPREADSHEET_ID = process.env.SHEETS_SPREADSHEET_ID || null;
+const SHEETS_INVITE_TAB_NAME = process.env.SHEETS_INVITE_TAB_NAME || 'Invites';
+const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || null;
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || null;
 
 // Helper: JSON-safe serializer for BigInt
 function serialize(value) {
@@ -54,6 +60,47 @@ let _oracle = null;
 let _signer = null;
 let _treasuryContract = null;
 let _neo4jDriver = undefined;
+let _sheetsClient = null;
+
+function getSheetsClient() {
+  if (_sheetsClient) return _sheetsClient;
+  if (!SHEETS_SPREADSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
+    console.warn('[sheets] Google Sheets not configured; invite logging disabled');
+    _sheetsClient = null;
+    return _sheetsClient;
+  }
+  try {
+    const jwt = new google.auth.JWT(
+      GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      undefined,
+      GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      ['https://www.googleapis.com/auth/spreadsheets']
+    );
+    _sheetsClient = google.sheets({ version: 'v4', auth: jwt });
+  } catch (err) {
+    console.error('[sheets] Failed to init Google Sheets client:', err.message || err);
+    _sheetsClient = null;
+  }
+  return _sheetsClient;
+}
+
+async function logInviteToSheet({ referrer, newUser, code, inviteToken }) {
+  const sheets = getSheetsClient();
+  if (!sheets) return;
+  try {
+    const timestampIso = new Date().toISOString();
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEETS_SPREADSHEET_ID,
+      range: `${SHEETS_INVITE_TAB_NAME}!A:Z`,
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [[timestampIso, referrer || '', newUser || '', code || '', inviteToken || '']]
+      }
+    });
+  } catch (err) {
+    console.error('[sheets] Error logging invite to sheet:', err.message || err);
+  }
+}
 
 function getProvider() {
   if (!_provider) {
@@ -636,6 +683,44 @@ class Neo4jReferralStore {
     }
   }
 
+  /**
+   * Create or refresh an invite token binding a referral code to a specific new user.
+   * Only used by the protocol-side /invite endpoint.
+   */
+  async createInvite(code, newUserAddress, token) {
+    const session = this.driver.session();
+    try {
+      const result = await session.executeWrite(tx =>
+        tx.run(
+          `
+          MATCH (referrer:User)-[:HAS_REFERRAL_CODE]->(c:ReferralCode {code:$code})
+          MERGE (newUser:User {address:$newUser})
+          MERGE (c)-[:HAS_INVITE]->(invite:ReferralInvite {code:$code, newUser:$newUser})
+          ON CREATE SET invite.token = $token,
+                        invite.createdAtMs = timestamp(),
+                        invite.used = false
+          ON MATCH SET invite.token = $token,
+                        invite.used = false,
+                        invite.updatedAtMs = timestamp()
+          RETURN referrer.address AS referrer, invite.token AS token
+          `,
+          { code, newUser: newUserAddress, token }
+        )
+      );
+      if (!result.records.length) return null;
+      const rec = result.records[0];
+      return {
+        referrer: rec.get('referrer'),
+        token: rec.get('token')
+      };
+    } catch (err) {
+      console.error('[Neo4jReferralStore] createInvite error:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+
   async getOrCreateCode(address) {
     const session = this.driver.session();
     try {
@@ -679,22 +764,25 @@ class Neo4jReferralStore {
     }
   }
 
-  async redeemCode(code, newUserAddress) {
+  async redeemCode(code, newUserAddress, inviteToken) {
     const session = this.driver.session();
     try {
       const result = await session.executeWrite(tx =>
         tx.run(
           `
           MATCH (referrer:User)-[:HAS_REFERRAL_CODE]->(c:ReferralCode {code:$code})
+          MATCH (c)-[:HAS_INVITE]->(invite:ReferralInvite {code:$code, newUser:$newUser, token:$token, used:false})
           MERGE (newUser:User {address:$newUser})
-          WITH referrer, newUser
+          WITH referrer, newUser, invite
           OPTIONAL MATCH (:User)-[r:REFERRED]->(newUser)
-          WITH referrer, newUser, r
+          WITH referrer, newUser, invite, r
           WHERE r IS NULL AND referrer.address <> newUser.address
+          SET invite.used = true,
+              invite.usedAtMs = timestamp()
           MERGE (referrer)-[:REFERRED {createdAtMs:timestamp()}]->(newUser)
           RETURN referrer.address AS referrer, newUser.address AS referred
           `,
-          { code, newUser: newUserAddress }
+          { code, newUser: newUserAddress, token: inviteToken }
         )
       );
       if (!result.records.length) return null;
@@ -1963,21 +2051,79 @@ app.post('/referral/code', async (req, res) => {
   }
 });
 
+// Protocol-side: create an invite token binding a referral code to a specific new user
+// Only callable by backend/protocol using shared secret header: x-protocol-key
+// body: { code: string, newUser: string }
+app.post('/invite', async (req, res) => {
+  try {
+    if (!PROTOCOL_INVITE_SECRET) {
+      return res.status(500).json({ error: 'invite secret not configured' });
+    }
+
+    const authKey = req.headers['x-protocol-key'];
+    if (!authKey || authKey !== PROTOCOL_INVITE_SECRET) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const { code, newUser } = req.body || {};
+    if (typeof code !== 'string' || !code.trim()) {
+      return res.status(400).json({ error: 'code required' });
+    }
+    const checksumNewUser = normalizeHexAddress(newUser);
+    if (!checksumNewUser) {
+      return res.status(400).json({ error: 'valid newUser address required' });
+    }
+    if (!referralStore) {
+      return res.status(500).json({ error: 'referral store not configured' });
+    }
+
+    const normalizedNew = normalizeAddress(checksumNewUser);
+    const inviteToken = randomUUID().replace(/-/g, '');
+
+    const invite = await referralStore.createInvite(code.trim(), normalizedNew, inviteToken);
+    if (!invite) {
+      return res.status(400).json({ error: 'invalid_code_or_referrer_not_found' });
+    }
+
+    // Log to Google Sheets (best-effort, non-blocking for client)
+    logInviteToSheet({
+      referrer: invite.referrer,
+      newUser: normalizedNew,
+      code: code.trim(),
+      inviteToken: invite.token
+    }).catch(err => {
+      console.error('[invite] failed to log to sheet:', err.message || err);
+    });
+
+    return res.json(serialize({
+      code: code.trim(),
+      newUser: normalizedNew,
+      referrer: invite.referrer,
+      inviteToken: invite.token
+    }));
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // Redeem a referral code for a new user, crediting both referrer and referred via engagement pipeline
 app.post('/referral/redeem', async (req, res) => {
   try {
-      const { code, newUser } = req.body || {};
+    const { code, newUser, inviteToken } = req.body || {};
     if (typeof code !== 'string' || !code.trim()) {
       return res.status(400).json({ error: 'code required' });
+    }
+    if (typeof inviteToken !== 'string' || !inviteToken.trim()) {
+      return res.status(400).json({ error: 'inviteToken required' });
     }
     const checksumNewUser = normalizeHexAddress(newUser);
     if (!checksumNewUser) return res.status(400).json({ error: 'valid newUser address required' });
     if (!referralStore) return res.status(500).json({ error: 'referral store not configured' });
 
     const normalizedNew = normalizeAddress(checksumNewUser);
-    const mapping = await referralStore.redeemCode(code.trim(), normalizedNew);
+    const mapping = await referralStore.redeemCode(code.trim(), normalizedNew, inviteToken.trim());
     if (!mapping) {
-      return res.status(400).json({ error: 'invalid_code_or_already_referred' });
+      return res.status(400).json({ error: 'invalid_code_invite_or_already_referred' });
     }
     const referrerAddr = mapping.referrer;
     const referredAddr = mapping.referred;
