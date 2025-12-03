@@ -185,54 +185,60 @@ const data = await res.json(); // { engagementId, address, action, credits, xp, 
 - The frontend can build referral links like: `https://yourapp.xyz/?rc=<code>`.
 
 ### POST `/referral/allow`
-- Purpose: let a referrer explicitly allow which addresses are permitted to redeem their referral code. This acts as an allow‑list on top of the code itself.
+- Purpose: let a referrer specify exactly which addresses they allow as valid referrals (anti-bot allow-list).
 - Body params (JSON):
-  - `referrer` (string, 0x-address): wallet that owns the referral code
-  - `allowed` (string[], 0x-addresses): list of addresses that this referrer approves as valid referrals
-- Behavior:
-  - Stores `(referrer)-[:ALLOWS_REFERRAL]->(allowedUser)` in Neo4j for each address
-  - A later `/referral/redeem` call for a code owned by `referrer` will only succeed if:
-    - The `newUser` has not already been referred, **and**
-    - There is an `ALLOWS_REFERRAL` edge for `(referrer, newUser)`
-- Response: `{ referrer, updated, allowed }`
-- Frontend:
-const res = await fetch('/referral/allow', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    referrer: '0xReferrer...',
-    allowed: ['0xFriendB...', '0xFriendC...']
-  })
-});
-const data = await res.json(); // { referrer, updated, allowed }
+  - `referrer` (string, 0x-address): the referrer’s wallet
+  - `allowed` (string[]): array of 0x-addresses the referrer explicitly allows
+- Response:
+  ```json
+  {
+    "referrer": "0xReferrer",
+    "updated": 2,
+    "allowed": ["0xAllowed1", "0xAllowed2"]
+  }
+  ```
+
+### POST `/invite`  (protocol/backend only)
+- Purpose: protocol-side endpoint to issue an invite token for a specific `code` + `newUser` pair. Even if the referrer has allow-listed an address, the protocol must still explicitly invite that address to redeem (helps block bots).
+- Auth:
+  - Header: `x-protocol-key: <PROTOCOL_INVITE_SECRET>`
+- Body params (JSON):
+  - `code` (string): referral code (e.g. `ASV-3F9K2`)
+  - `newUser` (string, 0x-address): wallet that is allowed to redeem this code
+- Response:
+  ```json
+  {
+    "code": "ASV-3F9K2",
+    "newUser": "0xNewUser",
+    "referrer": "0xReferrer",
+    "inviteToken": "f3c7e0c2f74a4b0e9b3c4d..."
+  }
+  ```
+- Side effect (optional): if Google Sheets env vars are configured, each successful `/invite` call appends a row to a Google Sheet:  
+  `timestamp ISO, referrer, newUser, referralCode, inviteToken`.
 
 ### POST `/referral/redeem`
-- Purpose: redeem a referral code when a new user signs up. This creates a `REFERRED` relationship in Neo4j and credits both the referrer and the new user via the engagement pipeline (`referral_you_refer` and `referral_you_are_referred` actions).
+- Purpose: redeem a referral code when a new user signs up. This creates a `REFERRED` relationship in Neo4j and credits both the referrer and the new user via the engagement pipeline (`referral_you_refer` and `referral_you_are_referred`), **only if**:
+  1. Code is valid and maps to a referrer.
+  2. Referrer has allow-listed this `newUser` via `/referral/allow`.
+  3. Protocol has issued a valid, unused `inviteToken` for this `(code, newUser)` via `/invite`.
 - Body params (JSON):
   - `code` (string): referral code (e.g. `ASV-3F9K2`)
   - `newUser` (string, 0x-address): wallet of the user who is joining with this code
+  - `inviteToken` (string): invite token previously returned by `/invite` for this code + newUser
 - Response:
   - On success: 
-   
+    ```json
     {
       "referrer": { "address": "...", "credits": 15, "xp": 30, "pendingCredits": 15 },
       "referred": { "address": "...", "credits": 5, "xp": 10, "pendingCredits": 5 }
     }
-      - On error: `{ error: "invalid_code_or_already_referred" | "self_referral_not_allowed" | "referral_not_allowed_by_referrer" | ... }`
-   
-        
-### POST `/referral/redeem`
-- Purpose: redeem a referral code when a new user signs up. This creates a `REFERRED` relationship in Neo4j and credits both the referrer and the new user via the engagement pipeline (`referral_you_refer` and `referral_you_are_referred` actions).
-- Body params (JSON):
-  - `code` (string): referral code (e.g. `ASV-3F9K2`)
-  - `newUser` (string, 0x-address): wallet of the user who is joining with this code
-- Response:
-  - On success: 
-    {
-      "referrer": { "address": "...", "credits": 15, "xp": 30, "pendingCredits": 15 },
-      "referred": { "address": "...", "credits": 5, "xp": 10, "pendingCredits": 5 }
-    }
-    
+    ```
+  - On error:  
+    ```json
+    { "error": "invalid_code_invite_or_already_referred" | "self_referral_not_allowed" | "referral_not_allowed_by_referrer" }
+    ```
+
 ### POST `/credits/initial-grant`  (Only oracle/owner or trusted backend)
 - Purpose: record a one-time initial credit grant (50 credits) when the user has no credits and no active subscription. The grant is stored as a pending calculated credit in Neo4j and immediately counted towards the user’s effective credits for `/inference/authorize` (even before on-chain settlement).
 - Body params (JSON):
@@ -324,6 +330,11 @@ Set env vars (Vercel → Project → Settings → Environment Variables):
 - `NEO4J_USERNAME` / `NEO4J_PASSWORD` = credentials (example username `neo4j`, password the one you provided)
 - `ORACLE_PRIVATE_KEY` = signer allowed to call `awardCreditsBatch` (needed for automatic settlement)
 - `BATCH_INTERVAL_MS` (optional) = how often to flush pending credits (default 3600000 ms = 1 hour)
+ - `PROTOCOL_INVITE_SECRET` = shared secret used by your backend to call `/invite`
+ - `SHEETS_SPREADSHEET_ID` (optional) = Google Sheets spreadsheet ID to log invites
+ - `SHEETS_INVITE_TAB_NAME` (optional) = Sheet/tab name inside the spreadsheet (default `Invites`)
+ - `GOOGLE_SERVICE_ACCOUNT_EMAIL` (optional) = service account email with edit access to the sheet
+ - `GOOGLE_PRIVATE_KEY` (optional) = private key from the service account JSON (with `\n`-escaped newlines)
 
 Local `.env` example (for `npm start`):
 ```
@@ -335,6 +346,11 @@ NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=GvvDuPnpTTfr0mOVgKhINbbstnztdzqAaSfrCxuHKeI
 ORACLE_PRIVATE_KEY=<hex private key of oracle signer>
 BATCH_INTERVAL_MS=3600000
+PROTOCOL_INVITE_SECRET=<random-long-secret>
+SHEETS_SPREADSHEET_ID=<google-sheets-id>
+SHEETS_INVITE_TAB_NAME=Invites
+GOOGLE_SERVICE_ACCOUNT_EMAIL=<service-account-email>
+GOOGLE_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n
 ```
 
 ## Local run
