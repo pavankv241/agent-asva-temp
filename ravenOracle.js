@@ -52,6 +52,8 @@ class RavenOracle {
             scores_sentiment: 2
         };
 
+
+
         this.COST_ALIASES = {
             general_reasoning: 'basic',
             generalreasoning: 'basic',
@@ -138,11 +140,6 @@ class RavenOracle {
     getInferenceCost(mode, quantity = 1, reason) {
         if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('quantity must be > 0');
 
-        const reasonCost = this._computeReasonCost(reason);
-        if (Number.isFinite(reasonCost)) {
-            return reasonCost * quantity;
-        }
-
         const normalized = String(mode || 'basic').toLowerCase();
         const path = normalized.split('.').filter(Boolean);
         if (!path.length) throw new Error('mode required');
@@ -160,7 +157,19 @@ class RavenOracle {
         }
 
         if (!Number.isFinite(unit)) throw new Error(`Unknown mode: ${mode}`);
-        return unit * quantity;
+
+        const baseUnit = unit;
+        const reasonUnit = this._computeReasonCost(reason);
+
+        // If reason-based pricing is available, use it – but never let scores.* modes
+        // become cheaper than their base cost (2 credits).
+        if (Number.isFinite(reasonUnit)) {
+            const isScoresMode = path[0] === 'scores';
+            const effectiveUnit = isScoresMode ? Math.max(reasonUnit, baseUnit) : reasonUnit;
+            return effectiveUnit * quantity;
+        }
+
+        return baseUnit * quantity;
     }
 
     // Simple per-process sliding window rate limiter
