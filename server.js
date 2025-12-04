@@ -3,7 +3,6 @@ const express = require('express');
 const { ethers } = require('ethers');
 const { randomUUID } = require('crypto');
 const neo4j = require('neo4j-driver');
-const { google } = require('googleapis');
 const RavenOracle = require('./ravenOracle');
 
 const app = express();
@@ -37,10 +36,13 @@ const NEO4J_URI = process.env.NEO4J_URI || process.env.NEO4J_URL || 'neo4j://loc
 const NEO4J_USERNAME = process.env.NEO4J_USERNAME || process.env.NEO4J_USER || 'neo4j';
 const NEO4J_PASSWORD = process.env.NEO4J_PASSWORD || null;
 const PROTOCOL_INVITE_SECRET = process.env.PROTOCOL_INVITE_SECRET || null;
-const SHEETS_SPREADSHEET_ID = process.env.SHEETS_SPREADSHEET_ID || null;
-const SHEETS_INVITE_TAB_NAME = process.env.SHEETS_INVITE_TAB_NAME || 'Invites';
-const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || null;
-const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY || null;
+// Microsoft Graph / Excel logging config (optional)
+const MS_TENANT_ID = process.env.MS_TENANT_ID || null;
+const MS_CLIENT_ID = process.env.MS_CLIENT_ID || null;
+const MS_CLIENT_SECRET = process.env.MS_CLIENT_SECRET || null;
+const MS_EXCEL_FILE_ID = process.env.MS_EXCEL_FILE_ID || null;
+const MS_EXCEL_WORKSHEET_NAME = process.env.MS_EXCEL_WORKSHEET_NAME || 'Invites';
+const MS_EXCEL_TABLE_NAME = process.env.MS_EXCEL_TABLE_NAME || 'Table1';
 
 // Helper: JSON-safe serializer for BigInt
 function serialize(value) {
@@ -60,45 +62,74 @@ let _oracle = null;
 let _signer = null;
 let _treasuryContract = null;
 let _neo4jDriver = undefined;
-let _sheetsClient = null;
+let _msGraphToken = null;
+let _msGraphTokenExpiresAt = 0;
 
-function getSheetsClient() {
-  if (_sheetsClient) return _sheetsClient;
-  if (!SHEETS_SPREADSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
-    console.warn('[sheets] Google Sheets not configured; invite logging disabled');
-    _sheetsClient = null;
-    return _sheetsClient;
+async function getMsGraphAccessToken() {
+  if (_msGraphToken && Date.now() < _msGraphTokenExpiresAt - 60_000) {
+    return _msGraphToken;
+  }
+  if (!MS_TENANT_ID || !MS_CLIENT_ID || !MS_CLIENT_SECRET) {
+    console.warn('[excel] Microsoft Graph not configured; invite logging disabled');
+    return null;
   }
   try {
-    const jwt = new google.auth.JWT(
-      GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      undefined,
-      GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      ['https://www.googleapis.com/auth/spreadsheets']
-    );
-    _sheetsClient = google.sheets({ version: 'v4', auth: jwt });
+    const params = new URLSearchParams();
+    params.append('client_id', MS_CLIENT_ID);
+    params.append('client_secret', MS_CLIENT_SECRET);
+    params.append('scope', 'https://graph.microsoft.com/.default');
+    params.append('grant_type', 'client_credentials');
+
+    const resp = await fetch(`https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error('[excel] Failed to get Graph token:', resp.status, text);
+      return null;
+    }
+    const data = await resp.json();
+    _msGraphToken = data.access_token;
+    const expiresIn = Number(data.expires_in || 3600);
+    _msGraphTokenExpiresAt = Date.now() + expiresIn * 1000;
+    return _msGraphToken;
   } catch (err) {
-    console.error('[sheets] Failed to init Google Sheets client:', err.message || err);
-    _sheetsClient = null;
+    console.error('[excel] Error getting Graph token:', err.message || err);
+    return null;
   }
-  return _sheetsClient;
 }
 
-async function logInviteToSheet({ referrer, newUser, code, inviteToken }) {
-  const sheets = getSheetsClient();
-  if (!sheets) return;
+async function logInviteToExcel({ referrer, newUser, code, inviteToken }) {
+  if (!MS_EXCEL_FILE_ID) return;
+  const token = await getMsGraphAccessToken();
+  if (!token) return;
   try {
     const timestampIso = new Date().toISOString();
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEETS_SPREADSHEET_ID,
-      range: `${SHEETS_INVITE_TAB_NAME}!A:Z`,
-      valueInputOption: 'RAW',
-      requestBody: {
+    const url = `https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(
+      MS_EXCEL_FILE_ID
+    )}/workbook/worksheets('${encodeURIComponent(
+      MS_EXCEL_WORKSHEET_NAME
+    )}')/tables('${encodeURIComponent(MS_EXCEL_TABLE_NAME)}')/rows/add`;
+
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
         values: [[timestampIso, referrer || '', newUser || '', code || '', inviteToken || '']]
-      }
+      })
     });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error('[excel] Failed to append invite row:', resp.status, text);
+    }
   } catch (err) {
-    console.error('[sheets] Error logging invite to sheet:', err.message || err);
+    console.error('[excel] Error logging invite to Excel:', err.message || err);
   }
 }
 
@@ -366,6 +397,52 @@ class MemoryCreditUsageStore {
   }
 }
 
+class MemorySubscriptionUsageStore {
+  constructor() {
+    this.usages = [];
+  }
+
+  async recordUsage(usage) {
+    const normalized = normalizeAddress(usage.address);
+    const entry = {
+      id: usage.id || randomUUID(),
+      address: normalized,
+      quantity: Number(usage.quantity) || 0,
+      isPriceAccuracyMode: Boolean(usage.isPriceAccuracyMode),
+      status: 'pending',
+      createdAt: Date.now()
+    };
+    if (entry.quantity <= 0) {
+      return { id: entry.id };
+    }
+    this.usages.push(entry);
+    return { id: entry.id };
+  }
+
+  async fetchPendingUsages() {
+    return this.usages
+      .filter(u => u.status === 'pending' && u.quantity > 0)
+      .map(u => ({
+        id: u.id,
+        address: u.address,
+        quantity: u.quantity,
+        isPriceAccuracyMode: u.isPriceAccuracyMode
+      }));
+  }
+
+  async markUsagesSettled(ids, txHash) {
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    for (const u of this.usages) {
+      if (u.status === 'pending' && idSet.has(u.id)) {
+        u.status = 'settled';
+        u.txHash = txHash;
+        u.settledAt = Date.now();
+      }
+    }
+  }
+}
+
 class MemoryInferenceUsageStore {
   constructor() {
     this.source = 'memory';
@@ -617,6 +694,97 @@ class Neo4jCreditUsageStore {
       );
     } catch (err) {
       console.error('[Neo4jCreditUsageStore] Error marking debits settled:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+}
+
+class Neo4jSubscriptionUsageStore {
+  constructor(driver) {
+    this.driver = driver;
+  }
+
+  async recordUsage(usage) {
+    const session = this.driver.session();
+    const id = usage.id || randomUUID();
+    try {
+      await session.executeWrite(tx =>
+        tx.run(
+          `
+          MERGE (u:User {address:$address})
+          CREATE (u)-[:HAS_SUBSCRIPTION_USAGE]->(s:SubscriptionUsage {
+            id: $id,
+            quantity: $quantity,
+            isPriceAccuracyMode: $isPriceAccuracyMode,
+            status: 'pending',
+            createdAtMs: timestamp()
+          })
+          `,
+          {
+            address: usage.address,
+            id,
+            quantity: Number(usage.quantity) || 0,
+            isPriceAccuracyMode: Boolean(usage.isPriceAccuracyMode)
+          }
+        )
+      );
+      return { id };
+    } catch (err) {
+      console.error('[Neo4jSubscriptionUsageStore] Error recording usage:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async fetchPendingUsages() {
+    const session = this.driver.session();
+    try {
+      const result = await session.executeRead(tx =>
+        tx.run(
+          `
+          MATCH (u:User)-[:HAS_SUBSCRIPTION_USAGE]->(s:SubscriptionUsage {status:'pending'})
+          RETURN s.id AS id,
+                 u.address AS address,
+                 s.quantity AS quantity,
+                 s.isPriceAccuracyMode AS isPriceAccuracyMode
+          `
+        )
+      );
+      return result.records.map(r => ({
+        id: r.get('id'),
+        address: r.get('address'),
+        quantity: Number(r.get('quantity') || 0),
+        isPriceAccuracyMode: Boolean(r.get('isPriceAccuracyMode'))
+      }));
+    } catch (err) {
+      console.error('[Neo4jSubscriptionUsageStore] Error fetching usages:', err.message || err);
+      throw err;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async markUsagesSettled(ids, txHash) {
+    if (!ids.length) return;
+    const session = this.driver.session();
+    try {
+      await session.executeWrite(tx =>
+        tx.run(
+          `
+          MATCH (:User)-[:HAS_SUBSCRIPTION_USAGE]->(s:SubscriptionUsage)
+          WHERE s.id IN $ids
+          SET s.status = 'settled',
+              s.txHash = $txHash,
+              s.settledAtMs = timestamp()
+          `,
+          { ids, txHash }
+        )
+      );
+    } catch (err) {
+      console.error('[Neo4jSubscriptionUsageStore] Error marking usages settled:', err.message || err);
       throw err;
     } finally {
       await session.close();
@@ -1144,6 +1312,15 @@ const creditUsageStore = (() => {
   return new MemoryCreditUsageStore();
 })();
 
+const subscriptionUsageStore = (() => {
+  const driver = getNeo4jDriver();
+  if (driver) {
+    return new Neo4jSubscriptionUsageStore(driver);
+  }
+  console.warn('[subscription-usage-store] Neo4j not configured; subscription usage settlement disabled');
+  return null;
+})();
+
 const referralStore = (() => {
   const driver = getNeo4jDriver();
   if (driver) {
@@ -1174,15 +1351,18 @@ function isModeAllowedForPlan(planId, mode) {
 }
 
 async function ClearPendingCredits(trigger = 'timer') {
-  const [pendingEngagements, pendingCalculations, pendingCreditDebits] = await Promise.all([
+  const [pendingEngagements, pendingCalculations, pendingCreditDebits, pendingSubscriptionUsages] = await Promise.all([
     engagementStore.fetchPendingEngagements(),
     engagementStore.fetchPendingCreditCalculations(),
     creditUsageStore && creditUsageStore.fetchPendingDebits
       ? creditUsageStore.fetchPendingDebits()
+      : [],
+    subscriptionUsageStore && subscriptionUsageStore.fetchPendingUsages
+      ? subscriptionUsageStore.fetchPendingUsages()
       : []
   ]);
 
-  if (!pendingEngagements.length && !pendingCalculations.length && !pendingCreditDebits.length) {
+  if (!pendingEngagements.length && !pendingCalculations.length && !pendingCreditDebits.length && !pendingSubscriptionUsages.length) {
     return { ok: true, trigger, message: 'no pending credits' };
   }
 
@@ -1317,6 +1497,39 @@ async function ClearPendingCredits(trigger = 'timer') {
         }
       } catch (err) {
         console.error(`[ClearPendingCredits] failed while settling credit debits for ${address}`, err);
+        return { ok: false, trigger, address, message: err.message || 'tx failed' };
+      }
+    }
+  }
+
+  if (pendingSubscriptionUsages.length) {
+    const groupedUsage = new Map(); // address -> { quantity, ids }
+    for (const u of pendingSubscriptionUsages) {
+      if (!groupedUsage.has(u.address)) {
+        groupedUsage.set(u.address, { quantity: 0, ids: [] });
+      }
+      const bucket = groupedUsage.get(u.address);
+      bucket.quantity += Number(u.quantity) || 0;
+      bucket.ids.push(u.id);
+    }
+
+    for (const [address, info] of groupedUsage.entries()) {
+      if (info.quantity <= 0) continue;
+      try {
+        // We now treat monthlyCap as the only cap for all modes, so we set isPriceAccuracyMode = false.
+        const tx = await contract.consumeSubscriptionUsage(address, info.quantity, false);
+        const receipt = await tx.wait();
+        txResults.push({
+          type: 'subscription_usage',
+          address,
+          quantity: info.quantity,
+          txHash: receipt.hash
+        });
+        if (subscriptionUsageStore && subscriptionUsageStore.markUsagesSettled) {
+          await subscriptionUsageStore.markUsagesSettled(info.ids, receipt.hash);
+        }
+      } catch (err) {
+        console.error(`[ClearPendingCredits] failed while settling subscription usage for ${address}`, err);
         return { ok: false, trigger, address, message: err.message || 'tx failed' };
       }
     }
@@ -1623,7 +1836,17 @@ async function cacheAuthorizationUsage({
         reason,
         remainingOverride: nextRemaining
       });
-}
+    }
+
+    // Record this subscription usage so it can be settled on-chain later via consumeSubscriptionUsage
+    if (subscriptionUsageStore && subscriptionUsageStore.recordUsage) {
+      await subscriptionUsageStore.recordUsage({
+        address: normalizedAddress,
+        quantity: Number(quantity) || 0,
+        // We no longer treat price_accuracy as having a separate global cap, so always false.
+        isPriceAccuracyMode: false
+      });
+    }
 
     if (earnedCreditsDelta > 0) {
       await recordSubscriptionEarnedCredits({
@@ -2085,14 +2308,14 @@ app.post('/invite', async (req, res) => {
       return res.status(400).json({ error: 'invalid_code_or_referrer_not_found' });
     }
 
-    // Log to Google Sheets (best-effort, non-blocking for client)
-    logInviteToSheet({
+    // Log to Microsoft Excel via Graph (best-effort, non-blocking for client)
+    logInviteToExcel({
       referrer: invite.referrer,
       newUser: normalizedNew,
       code: code.trim(),
       inviteToken: invite.token
     }).catch(err => {
-      console.error('[invite] failed to log to sheet:', err.message || err);
+      console.error('[invite] failed to log to Excel:', err.message || err);
     });
 
     return res.json(serialize({
