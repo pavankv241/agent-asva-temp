@@ -228,10 +228,22 @@ class RavenOracle {
         const normalizedMode = String(mode || 'basic').toLowerCase();
         let normalizedReason = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
         if (tagsFlag) {
-            const hasTagsWord = normalizedReason && /tag/i.test(normalizedReason);
+            const base = normalizedReason || '';
+            let augmented = base;
+
+            // Ensure "tags" is present for pricing
+            const hasTagsWord = /tag/i.test(augmented);
             if (!hasTagsWord) {
-                normalizedReason = normalizedReason ? `${normalizedReason} tags` : 'tags';
+                augmented = augmented ? `${augmented} tags` : 'tags';
             }
+
+            // For basic/empty mode, also imply "general reasoning" so basic+tags => cost 2
+            const hasReasonWord = /(\bgeneral\b|\bgen\b|\breasoning\b|\bbasic\b|\breason\b)/i.test(augmented);
+            if (!hasReasonWord && (!mode || normalizedMode === 'basic')) {
+                augmented = augmented ? `${augmented} general reasoning` : 'general reasoning';
+            }
+
+            normalizedReason = augmented;
         }
         const cost = this.getInferenceCost(normalizedMode, quantity, normalizedReason);
         const isPriceAccuracyMode =
