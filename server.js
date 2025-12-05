@@ -1690,18 +1690,20 @@ async function recordInferenceUsageSnapshot({
 
       // Final safeguard: Check current stored value and never increase remaining
       // This prevents race conditions and incorrect updates
+      // BUT: Always allow decreases (when remainingValue < currentRemaining) - this is legitimate usage
       if (inferenceStore && inferenceStore.getRemaining) {
         try {
           const currentStored = await inferenceStore.getRemaining(normalizedAddress, normalizedMode);
           if (currentStored && currentStored.remaining !== undefined && currentStored.remaining !== null) {
             const currentRemaining = Number(currentStored.remaining);
-            // Never write a value higher than what's currently stored (unless plan changed)
+            // Only prevent if trying to increase AND plan hasn't changed
+            // Decreases are always allowed (legitimate usage)
             if (remainingValue > currentRemaining && currentStored.planId === planId) {
               console.warn(`[recordInferenceUsageSnapshot] Prevented remaining increase: current=${currentRemaining}, attempted=${remainingValue} for ${normalizedAddress} mode=${normalizedMode}`);
-              // Use current value instead (or current - quantity if this is a usage update)
-              // But we don't know quantity here, so just keep current value
+              // Use current value instead - but this should rarely happen
               remainingValue = currentRemaining;
             }
+            // Explicitly allow decreases (remainingValue < currentRemaining) - no action needed
           }
         } catch (err) {
           // If check fails, continue with calculated value (fail open)
@@ -1859,10 +1861,19 @@ async function cacheAuthorizationUsage({
     }
     
     if (!Number.isFinite(baseline)) return;
-    const nextRemaining = Math.max(baseline - Number(quantity || 0), 0);
+    
+    // If we have a valid cached value, ALWAYS use it as baseline (it's the most accurate)
+    // This ensures we're always working from the correct starting point
+    if (stored && stored.remaining !== undefined && stored.remaining !== null && planMatches) {
+      const cachedRemaining = Number(stored.remaining);
+      baseline = cachedRemaining; // Use cached value as baseline
+    }
+    
+    const quantityNum = Number(quantity || 0);
+    const nextRemaining = Math.max(baseline - quantityNum, 0);
 
     // Safeguard: Never increase remaining count - it should only decrease
-    // If we have a cached value that's lower (more accurate), use that instead
+    // This should rarely trigger now since we're using cached value as baseline
     let finalRemaining = nextRemaining;
     if (stored && stored.remaining !== undefined && stored.remaining !== null && planMatches) {
       const cachedRemaining = Number(stored.remaining);
@@ -1870,8 +1881,14 @@ async function cacheAuthorizationUsage({
       // This means baseline was calculated incorrectly (too high)
       if (nextRemaining > cachedRemaining) {
         // Recalculate from cached value instead
-        finalRemaining = Math.max(0, cachedRemaining - Number(quantity || 0));
+        finalRemaining = Math.max(0, cachedRemaining - quantityNum);
         console.warn(`[cacheAuthorizationUsage] Prevented remaining increase: cached=${cachedRemaining}, calculated=${nextRemaining}, corrected=${finalRemaining} for ${user}`);
+      }
+      // If nextRemaining equals cachedRemaining and quantity > 0, something is wrong
+      else if (nextRemaining === cachedRemaining && quantityNum > 0) {
+        // Force decrease from cached value
+        finalRemaining = Math.max(0, cachedRemaining - quantityNum);
+        console.warn(`[cacheAuthorizationUsage] Fixed remaining not decreasing: cached=${cachedRemaining}, quantity=${quantityNum}, corrected=${finalRemaining} for ${user}`);
       }
     }
 
