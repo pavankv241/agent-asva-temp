@@ -2208,7 +2208,10 @@ app.get('/users/:address/summary', async (req, res) => {
       const planChanged = cachedPlanId !== null && cachedPlanId !== planId;
       const shouldRefresh = planChanged || subscriptionRenewedRecently;
       
-      if (stored && stored.remaining !== undefined && stored.remaining !== null && Number(stored.remaining) >= 0 && !shouldRefresh) {
+      // Only use cached value if it's valid and we don't need to refresh
+      // Cache is the source of truth for remaining count (updated after each authorization)
+      if (stored && stored.remaining !== undefined && stored.remaining !== null && 
+          Number(stored.remaining) >= 0 && !shouldRefresh && planMatches) {
         // Use cached value if plan hasn't changed and subscription wasn't recently renewed
         // Cache already accounts for pending usage (updated after each authorization)
         inference.remaining = String(stored.remaining);
@@ -2238,11 +2241,31 @@ app.get('/users/:address/summary', async (req, res) => {
           remaining = planMonthlyCap;
         }
         
+        // Safeguard: Never increase remaining count (it should only decrease or stay same)
+        // If we have a cached value, only update if new value is lower (more accurate)
+        if (stored && stored.remaining !== undefined && stored.remaining !== null) {
+          const cachedRemaining = Number(stored.remaining);
+          // Only update if new value is lower (more usage) or if plan changed/renewed
+          if (remaining > cachedRemaining && !planChanged && !subscriptionRenewedRecently) {
+            // Don't overwrite cache with a higher value - use cached value instead
+            remaining = cachedRemaining;
+            inference.source = stored.source || 'neo4j';
+            if (stored.updatedAt) {
+              inference.updatedAt = stored.updatedAt;
+            }
+          }
+        }
+        
         inference.remaining = String(remaining);
-        inference.source = planChanged ? 'plan_reset' : 'onchain';
+        // Set source if not already set by safeguard logic above
+        if (!inference.source) {
+          inference.source = planChanged ? 'plan_reset' : 'onchain';
+        }
         
         // Update cache with fresh data for all modes (accounting for pending usage)
-        if (hasActiveSub && Number.isFinite(remaining) && remaining >= 0) {
+        // Only update if we're not using cached value (to avoid unnecessary writes)
+        if (hasActiveSub && Number.isFinite(remaining) && remaining >= 0 && 
+            (!stored || remaining !== Number(stored?.remaining) || planChanged || subscriptionRenewedRecently)) {
           try {
             const snapshotModes = ['basic', 'tags', 'price_accuracy', 'full', 'general'];
             for (const m of snapshotModes) {
