@@ -2201,6 +2201,7 @@ app.get('/users/:address/summary', async (req, res) => {
       
       // Check if cached planId matches current planId, or if subscription was recently renewed
       const cachedPlanId = stored?.planId;
+      const planMatches = cachedPlanId !== null && cachedPlanId === planId;
       const subscriptionRenewedRecently = subscription?.lastRenewedAt 
         ? (Date.now() / 1000 - Number(subscription.lastRenewedAt)) < 300 // Within last 5 minutes
         : false;
