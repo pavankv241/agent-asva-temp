@@ -1688,6 +1688,27 @@ async function recordInferenceUsageSnapshot({
         remainingValue = Math.max(Math.min(remainingValue, effectiveCap), 0);
       }
 
+      // Final safeguard: Check current stored value and never increase remaining
+      // This prevents race conditions and incorrect updates
+      if (inferenceStore && inferenceStore.getRemaining) {
+        try {
+          const currentStored = await inferenceStore.getRemaining(normalizedAddress, normalizedMode);
+          if (currentStored && currentStored.remaining !== undefined && currentStored.remaining !== null) {
+            const currentRemaining = Number(currentStored.remaining);
+            // Never write a value higher than what's currently stored (unless plan changed)
+            if (remainingValue > currentRemaining && currentStored.planId === planId) {
+              console.warn(`[recordInferenceUsageSnapshot] Prevented remaining increase: current=${currentRemaining}, attempted=${remainingValue} for ${normalizedAddress} mode=${normalizedMode}`);
+              // Use current value instead (or current - quantity if this is a usage update)
+              // But we don't know quantity here, so just keep current value
+              remainingValue = currentRemaining;
+            }
+          }
+        } catch (err) {
+          // If check fails, continue with calculated value (fail open)
+          console.error('[recordInferenceUsageSnapshot] Error checking current stored value:', err.message || err);
+        }
+      }
+
       payload.planMonthlyCap = planMonthlyCap;
       payload.planId = planId;
       payload.usedThisWindow = used;
@@ -1840,11 +1861,29 @@ async function cacheAuthorizationUsage({
     if (!Number.isFinite(baseline)) return;
     const nextRemaining = Math.max(baseline - Number(quantity || 0), 0);
 
+    // Safeguard: Never increase remaining count - it should only decrease
+    // If we have a cached value that's lower (more accurate), use that instead
+    let finalRemaining = nextRemaining;
+    if (stored && stored.remaining !== undefined && stored.remaining !== null && planMatches) {
+      const cachedRemaining = Number(stored.remaining);
+      // If calculated nextRemaining is higher than cached, something is wrong
+      // This means baseline was calculated incorrectly (too high)
+      if (nextRemaining > cachedRemaining) {
+        // Recalculate from cached value instead
+        finalRemaining = Math.max(0, cachedRemaining - Number(quantity || 0));
+        console.warn(`[cacheAuthorizationUsage] Prevented remaining increase: cached=${cachedRemaining}, calculated=${nextRemaining}, corrected=${finalRemaining} for ${user}`);
+      }
+    }
+
     let earnedCreditsDelta = 0;
     const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
     if (planMonthlyCap > 0) {
-      const totalUsedBefore = planMonthlyCap - baseline;
-      const totalUsedAfter = planMonthlyCap - nextRemaining;
+      // Use the actual baseline that was used (cached if available, otherwise calculated)
+      const actualBaseline = (stored && stored.remaining !== undefined && stored.remaining !== null && planMatches) 
+        ? Number(stored.remaining) 
+        : baseline;
+      const totalUsedBefore = planMonthlyCap - actualBaseline;
+      const totalUsedAfter = planMonthlyCap - finalRemaining;
       const creditsBefore = Math.floor(totalUsedBefore / 2);
       const creditsAfter = Math.floor(totalUsedAfter / 2);
       earnedCreditsDelta = Math.max(0, creditsAfter - creditsBefore);
@@ -1861,7 +1900,7 @@ async function cacheAuthorizationUsage({
         cost: 0,
         contextHash,
         reason,
-        remainingOverride: nextRemaining
+        remainingOverride: finalRemaining
       });
     }
 
