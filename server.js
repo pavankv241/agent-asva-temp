@@ -1696,12 +1696,20 @@ async function recordInferenceUsageSnapshot({
           const currentStored = await inferenceStore.getRemaining(normalizedAddress, normalizedMode);
           if (currentStored && currentStored.remaining !== undefined && currentStored.remaining !== null) {
             const currentRemaining = Number(currentStored.remaining);
+            const quantityNum = Number(quantity || 0);
+            
             // Only prevent if trying to increase AND plan hasn't changed
             // Decreases are always allowed (legitimate usage)
             if (remainingValue > currentRemaining && currentStored.planId === planId) {
               console.warn(`[recordInferenceUsageSnapshot] Prevented remaining increase: current=${currentRemaining}, attempted=${remainingValue} for ${normalizedAddress} mode=${normalizedMode}`);
               // Use current value instead - but this should rarely happen
               remainingValue = currentRemaining;
+            }
+            // If remainingValue equals currentRemaining but we have quantity > 0, we should still decrease
+            // This handles the case where the override value wasn't calculated correctly
+            else if (remainingValue === currentRemaining && quantityNum > 0 && currentStored.planId === planId) {
+              console.warn(`[recordInferenceUsageSnapshot] Remaining not decreasing despite quantity > 0: current=${currentRemaining}, quantity=${quantityNum}, forcing decrease for ${normalizedAddress} mode=${normalizedMode}`);
+              remainingValue = Math.max(0, currentRemaining - quantityNum);
             }
             // Explicitly allow decreases (remainingValue < currentRemaining) - no action needed
           }
@@ -1826,7 +1834,10 @@ async function cacheAuthorizationUsage({
     const subscription = await getOracle().getUserSubscription(user);
     const currentPlanId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
     
-    const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
+    // For subscription-based inference, all modes share the same pool, so always check 'general' mode
+    // This ensures we find the cached remaining count regardless of the specific mode requested
+    const cacheLookupMode = 'general';
+    const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
     let baseline = null;
     
     // Only use cached value if planId matches current planId
@@ -1847,7 +1858,8 @@ async function cacheAuthorizationUsage({
         baseline = planMonthlyCap;
       } else {
         // Cache miss: fetch actual on-chain state (includes window reset logic)
-        const onchainRemaining = Number(await getOracle().getRemainingInference(user, mode));
+        // Use 'general' mode for on-chain lookup since all modes share the same subscription pool
+        const onchainRemaining = Number(await getOracle().getRemainingInference(user, 'general'));
         
         // Account for pending usage that hasn't been settled on-chain yet
         const pendingUsage = await getPendingSubscriptionUsage(user);
@@ -1877,6 +1889,8 @@ async function cacheAuthorizationUsage({
     let finalRemaining = nextRemaining;
     if (stored && stored.remaining !== undefined && stored.remaining !== null && planMatches) {
       const cachedRemaining = Number(stored.remaining);
+      console.log(`[cacheAuthorizationUsage] Deducting inference: user=${user}, mode=${normalizedMode}, cachedRemaining=${cachedRemaining}, baseline=${baseline}, quantity=${quantityNum}, nextRemaining=${nextRemaining}`);
+      
       // If calculated nextRemaining is higher than cached, something is wrong
       // This means baseline was calculated incorrectly (too high)
       if (nextRemaining > cachedRemaining) {
@@ -1890,7 +1904,16 @@ async function cacheAuthorizationUsage({
         finalRemaining = Math.max(0, cachedRemaining - quantityNum);
         console.warn(`[cacheAuthorizationUsage] Fixed remaining not decreasing: cached=${cachedRemaining}, quantity=${quantityNum}, corrected=${finalRemaining} for ${user}`);
       }
+      
+      // Ensure we actually decreased if quantity > 0
+      if (quantityNum > 0 && finalRemaining >= cachedRemaining) {
+        console.error(`[cacheAuthorizationUsage] ERROR: Remaining did not decrease! cached=${cachedRemaining}, finalRemaining=${finalRemaining}, quantity=${quantityNum} for ${user}`);
+        // Force decrease
+        finalRemaining = Math.max(0, cachedRemaining - quantityNum);
+      }
     }
+    
+    console.log(`[cacheAuthorizationUsage] Final remaining after deduction: ${finalRemaining} for ${user}, quantity=${quantityNum}`);
 
     let earnedCreditsDelta = 0;
     const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
@@ -1969,8 +1992,9 @@ app.post('/inference/authorize', async (req, res) => {
       const subscription = await getOracle().getUserSubscription(checksumUser);
       if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
         const normalizedAddress = normalizeAddress(checksumUser);
-        const normalizedMode = resolvedMode.toLowerCase();
-        const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
+        // For subscription-based inference, all modes share the same pool, so always check 'general' mode
+        const cacheLookupMode = 'general';
+        const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
         
         // Only use Neo4j pending usage if planId matches (cache is for current plan)
         const currentPlanId = Number(subscription.planId);
