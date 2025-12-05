@@ -1737,6 +1737,21 @@ async function getPendingEngagementCredits(address) {
   }
 }
 
+async function getPendingSubscriptionUsage(address) {
+  if (!subscriptionUsageStore || !subscriptionUsageStore.fetchPendingUsages) return 0;
+  try {
+    const normalized = normalizeAddress(address);
+    const allPending = await subscriptionUsageStore.fetchPendingUsages();
+    const userPending = allPending
+      .filter(u => u.address.toLowerCase() === normalized.toLowerCase())
+      .reduce((sum, u) => sum + (Number(u.quantity) || 0), 0);
+    return userPending;
+  } catch (err) {
+    console.error('[subscription-usage-store] getPendingSubscriptionUsage error:', err.message || err);
+    return 0;
+  }
+}
+
 async function cacheCreditAuthorization({ user, cost, contextHash, reason }) {
   if (!creditUsageStore) return;
   const numericCost = Number(cost);
@@ -1794,19 +1809,31 @@ async function cacheAuthorizationUsage({
     // Only use cached value if planId matches current planId
     const cachedPlanId = stored?.planId;
     const planMatches = cachedPlanId !== null && cachedPlanId === currentPlanId;
+    const planChanged = cachedPlanId !== null && cachedPlanId !== currentPlanId;
     
     if (stored && stored.remaining !== undefined && stored.remaining !== null && planMatches) {
       // Use cached value only if plan hasn't changed
+      // Cache already accounts for all usage (including pending)
       baseline = Number(stored.remaining);
     } else {
-      // Plan changed or cache miss: reset to new plan's monthlyCap
+      // Plan changed or cache miss: fetch from on-chain first
       const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
-      if (planMonthlyCap > 0) {
+      
+      if (planChanged && planMonthlyCap > 0) {
+        // Plan changed: reset to new plan's full cap
         baseline = planMonthlyCap;
       } else {
-        // Fallback to on-chain if no plan
-      const onchainRemaining = await getOracle().getRemainingInference(user, mode);
-      baseline = Number(onchainRemaining);
+        // Cache miss: fetch actual on-chain state (includes window reset logic)
+        const onchainRemaining = Number(await getOracle().getRemainingInference(user, mode));
+        
+        // Account for pending usage that hasn't been settled on-chain yet
+        const pendingUsage = await getPendingSubscriptionUsage(user);
+        baseline = Math.max(0, onchainRemaining - pendingUsage);
+        
+        // Fallback to planMonthlyCap only if on-chain fetch failed
+        if (!Number.isFinite(baseline) || baseline < 0) {
+          baseline = planMonthlyCap;
+        }
       }
     }
     
@@ -1850,7 +1877,7 @@ async function cacheAuthorizationUsage({
 
     if (earnedCreditsDelta > 0) {
       await recordSubscriptionEarnedCredits({
-  user,
+        user,
         credits: earnedCreditsDelta,
         planId: currentPlanId
       });
@@ -2183,29 +2210,39 @@ app.get('/users/:address/summary', async (req, res) => {
       
       if (stored && stored.remaining !== undefined && stored.remaining !== null && Number(stored.remaining) >= 0 && !shouldRefresh) {
         // Use cached value if plan hasn't changed and subscription wasn't recently renewed
+        // Cache already accounts for pending usage (updated after each authorization)
         inference.remaining = String(stored.remaining);
         inference.source = stored.source || 'neo4j';
         if (stored.updatedAt) {
           inference.updatedAt = stored.updatedAt;
         }
       } else {
-        // Plan changed or subscription renewed: reset to new plan's monthlyCap
+        // Plan changed, subscription renewed, or cache miss: fetch from on-chain first
         const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
-        let remaining = planMonthlyCap;
+        let remaining = null;
         
         if (planChanged && planMonthlyCap > 0) {
           // Plan changed: reset to new plan's full cap
           remaining = planMonthlyCap;
-        } else if (subscriptionRenewedRecently) {
-          // Subscription renewed: fetch from on-chain (should be reset to cap)
-          remaining = await getOracle().getRemainingInference(checksumAddr, checkMode);
+        } else {
+          // Subscription renewed or cache miss: fetch actual on-chain state
+          const onChainRemaining = Number(await getOracle().getRemainingInference(checksumAddr, checkMode));
+          
+          // Account for pending usage that hasn't been settled on-chain yet
+          const pendingUsage = await getPendingSubscriptionUsage(checksumAddr);
+          remaining = Math.max(0, onChainRemaining - pendingUsage);
+        }
+        
+        // Fallback to planMonthlyCap only if on-chain fetch failed
+        if (!Number.isFinite(remaining) || remaining < 0) {
+          remaining = planMonthlyCap;
         }
         
         inference.remaining = String(remaining);
         inference.source = planChanged ? 'plan_reset' : 'onchain';
         
-        // Update cache with fresh data for all modes
-        if (hasActiveSub && Number(remaining) >= 0) {
+        // Update cache with fresh data for all modes (accounting for pending usage)
+        if (hasActiveSub && Number.isFinite(remaining) && remaining >= 0) {
           try {
             const snapshotModes = ['basic', 'tags', 'price_accuracy', 'full', 'general'];
             for (const m of snapshotModes) {
@@ -2216,7 +2253,7 @@ app.get('/users/:address/summary', async (req, res) => {
               quantity: 0,
               cost: 0,
               contextHash: '',
-              reason: planChanged ? 'plan_changed' : 'subscription_renewed',
+              reason: planChanged ? 'plan_changed' : (subscriptionRenewedRecently ? 'subscription_renewed' : 'cache_refresh'),
               remainingOverride: Number(remaining)
             });
             }
@@ -2441,11 +2478,11 @@ app.post('/referral/redeem', async (req, res) => {
         referrer: checksumRef,
         updated,
         allowed: normalizedAllowed
-      }));
-    } catch (e) {
-      return res.status(500).json({ error: e.message });
-    }
-  });
+    }));
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
 
 // Check if a user has an active subscription (boolean)
 app.get('/users/:address/has-active-subscription', async (req, res) => {
