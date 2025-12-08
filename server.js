@@ -1966,7 +1966,8 @@ async function cacheAuthorizationUsage({
   }
 }
 
-// Authorization helper (reads on-chain state)
+// Authorization check only (reads on-chain state, no state updates)
+// Called before submitting query to AI MCP server
 // body: { user: string, mode?: string, quantity?: number, contextHash?: string, reason?: string, tags?: boolean }
 app.post('/inference/authorize', async (req, res) => {
   try {
@@ -2052,7 +2053,118 @@ app.post('/inference/authorize', async (req, res) => {
       reasonValue
     );
 
-    if (result?.allowed && result.method === 'subscription') {
+    // Authorization check only - no state updates
+    // State updates should be done via /inference/record after successful AI inference
+    return res.json(serialize({
+      ...result,
+      mode: resolvedMode,
+      contextHash: contextHashValue
+    }));
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
+
+// Record inference usage and update off-chain state (billing, over-spending prevention, state updates)
+// Called after successful AI inference response
+// body: { user: string, mode?: string, quantity?: number, contextHash?: string, reason?: string, tags?: boolean }
+app.post('/inference/record', async (req, res) => {
+  try {
+    const { user, mode, quantity = 1, contextHash = '', reason, tags } = req.body || {};
+    const checksumUser = normalizeHexAddress(user);
+    if (!checksumUser) return res.status(400).json({ error: 'valid user address required' });
+    const numericQuantity = Number(quantity);
+    if (!Number.isFinite(numericQuantity) || numericQuantity <= 0) {
+      return res.status(400).json({ error: 'quantity must be > 0' });
+    }
+    const contextHashValue = typeof contextHash === 'string' ? contextHash : '';
+    const reasonValue = typeof reason === 'string' && reason.length > 0 ? reason : undefined;
+    const tagsFlag = Boolean(tags);
+    let resolvedMode = (typeof mode === 'string' && mode.length > 0) ? mode : null;
+    if (!resolvedMode) {
+      resolvedMode = 'basic';
+    }
+
+    // Calculate pending usage from Neo4j to prevent exceeding cap before settlement
+    // This ensures users can't exceed their monthly cap even if settlement happens hourly
+    let pendingUsageFromNeo4j = 0;
+    try {
+      const subscription = await getOracle().getUserSubscription(checksumUser);
+      if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
+        const normalizedAddress = normalizeAddress(checksumUser);
+        // For subscription-based inference, all modes share the same pool, so always check 'general' mode
+        const cacheLookupMode = 'general';
+        const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
+        
+        // Only use Neo4j pending usage if planId matches (cache is for current plan)
+        const currentPlanId = Number(subscription.planId);
+        const cachedPlanId = stored?.planId;
+        if (stored && stored.remaining !== undefined && stored.remaining !== null &&
+            cachedPlanId !== null && cachedPlanId === currentPlanId) {
+          const monthlyCap = Number(subscription.plan.monthlyCap);
+          const onChainUsed = Number(subscription.usedThisWindow);
+          const remainingFromNeo4j = Number(stored.remaining);
+          // Calculate pending: total used (from remaining) - on-chain settled usage
+          // remaining = monthlyCap - totalUsed, so totalUsed = monthlyCap - remaining
+          const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
+          pendingUsageFromNeo4j = Math.max(0, totalUsedFromNeo4j - onChainUsed);
+        }
+      }
+    } catch (err) {
+      console.error('[record] Error calculating pending usage from Neo4j:', err.message || err);
+      // Continue with on-chain check only if Neo4j fails
+    }
+
+    let pendingCreditsFromNeo4j = 0;
+    try {
+      pendingCreditsFromNeo4j = await getPendingCreditUsage(checksumUser);
+    } catch (err) {
+      console.error('[record] Error calculating pending credits from Neo4j:', err.message || err);
+    }
+
+    let pendingEngagementFromNeo4j = 0;
+    try {
+      pendingEngagementFromNeo4j = await getPendingEngagementCredits(checksumUser);
+    } catch (err) {
+      console.error('[record] Error calculating pending engagement credits from Neo4j:', err.message || err);
+    }
+
+    let pendingCalculatedFromNeo4j = 0;
+    try {
+      if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
+        const normalizedAddress = normalizeAddress(checksumUser);
+        const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
+        pendingCalculatedFromNeo4j = Number(calculated?.totalCalculatedCredits || 0);
+      }
+    } catch (err) {
+      console.error('[record] Error calculating pending calculated credits from Neo4j:', err.message || err);
+    }
+
+    // Re-check authorization to prevent race conditions and determine billing method
+    const result = await getOracle().authorizeInference(
+      user,
+      resolvedMode,
+      numericQuantity,
+      pendingUsageFromNeo4j,
+      pendingCreditsFromNeo4j,
+      pendingCalculatedFromNeo4j,
+      pendingEngagementFromNeo4j,
+      tagsFlag,
+      reasonValue
+    );
+
+    // If not allowed, return error (shouldn't happen if authorize was called first, but safety check)
+    if (!result?.allowed) {
+      return res.status(403).json(serialize({
+        error: 'Inference not authorized',
+        ...result,
+        mode: resolvedMode,
+        contextHash: contextHashValue
+      }));
+    }
+
+    // Update off-chain state based on billing method
+    if (result.method === 'subscription') {
       await cacheAuthorizationUsage({
         user: checksumUser,
         mode: resolvedMode,
@@ -2061,7 +2173,7 @@ app.post('/inference/authorize', async (req, res) => {
         contextHash: contextHashValue,
         reason: reasonValue
       });
-    } else if (result?.allowed && result.method === 'credits') {
+    } else if (result.method === 'credits') {
       await cacheCreditAuthorization({
         user: checksumUser,
         cost: result.cost,
@@ -2069,8 +2181,10 @@ app.post('/inference/authorize', async (req, res) => {
         reason: reasonValue
       });
     }
+    // Note: 'initial_grant' method doesn't need state update (handled on-chain later)
 
     return res.json(serialize({
+      success: true,
       ...result,
       mode: resolvedMode,
       contextHash: contextHashValue
