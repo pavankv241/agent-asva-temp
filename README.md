@@ -241,34 +241,50 @@ const data = await res.json(); // { engagementId, address, action, credits, xp, 
   }
   ```
 
-### POST `/invite`  (protocol/backend only)
-- Purpose: protocol-side endpoint to issue an invite token for a specific `code` + `newUser` pair. Even if the referrer has allow-listed an address, the protocol must still explicitly invite that address to redeem (helps block bots).
-- Auth:
-  - Header: `x-protocol-key: <PROTOCOL_INVITE_SECRET>`
+### POST `/invite`
+- Purpose: Validate and assign a static invite code from Excel to a specific `newUser` address. Codes are pre-generated and stored in Microsoft Excel/OneDrive. Can be called directly from frontend.
 - Body params (JSON):
-  - `code` (string): referral code (e.g. `ASV-3F9K2`)
-  - `newUser` (string, 0x-address): wallet that is allowed to redeem this code
+  - `code` (string): static invite code from Excel (e.g. `00d697e665b1667a`)
+  - `newUser` (string, 0x-address): wallet that will use this code
 - Response:
   ```json
   {
-    "code": "ASV-3F9K2",
+    "code": "00d697e665b1667a",
     "newUser": "0xNewUser",
     "referrer": "0xReferrer",
-    "inviteToken": "f3c7e0c2f74a4b0e9b3c4d..."
+    "usedAt": "2025-12-08T14:00:00.000Z"
   }
   ```
-- Side effect (optional): if Google Sheets env vars are configured, each successful `/invite` call appends a row to a Google Sheet:  
-  `timestamp ISO, referrer, newUser, referralCode, inviteToken`.
+- Behavior:
+  - Checks if code exists in Excel table
+  - Validates code is not already used
+  - If `assignedTo` column is set, verifies it matches `newUser`
+  - Updates Excel row: sets `usedBy` to `newUser` and `usedAt` to current timestamp
+- Errors:
+  - `400 invalid_code_not_found`: Code doesn't exist in Excel
+  - `400 code_already_used`: Code was already assigned to another user
+  - `403 code_not_assigned_to_this_user`: Code is assigned to a different address
 
 ### POST `/referral/redeem`
-- Purpose: redeem a referral code when a new user signs up. This creates a `REFERRED` relationship in Neo4j and credits both the referrer and the new user via the engagement pipeline (`referral_you_refer` and `referral_you_are_referred`), **only if**:
-  1. Code is valid and maps to a referrer.
-  2. Referrer has allow-listed this `newUser` via `/referral/allow`.
-  3. Protocol has issued a valid, unused `inviteToken` for this `(code, newUser)` via `/invite`.
+- Purpose: redeem an invite code when a new user signs up. Validates code against Excel, creates referral relationship in Neo4j (if referrer exists), and credits both referrer and new user via engagement pipeline (`referral_you_refer` and `referral_you_are_referred`).
 - Body params (JSON):
-  - `code` (string): referral code (e.g. `ASV-3F9K2`)
+  - `code` (string): invite code from Excel (e.g. `00d697e665b1667a`)
   - `newUser` (string, 0x-address): wallet of the user who is joining with this code
-  - `inviteToken` (string): invite token previously returned by `/invite` for this code + newUser
+- Behavior:
+  - Checks Excel to verify code exists and is assigned to `newUser`
+  - Gets referrer from Excel `referrer` column (if set)
+  - Creates engagement records for both referrer and referred user
+  - Updates Excel row with redemption info:
+    - Updates `usedBy` field with the redeeming user's address
+    - Updates `usedAt` field with redemption timestamp
+    - Updates `referrer` field if referrer exists
+    - Appends redemption details to `notes` field
+  - If referrer exists, creates referral relationship in Neo4j
+- Errors:
+  - `400 invalid_code_not_found`: Code doesn't exist in Excel
+  - `400 code_not_assigned_to_this_user`: Code is not assigned to this user
+  - `400 referral_already_exists`: Referral relationship already exists
+  - `400 self_referral_not_allowed`: User cannot refer themselves
 - Response:
   - On success: 
     ```json
@@ -374,12 +390,13 @@ Set env vars (Vercel → Project → Settings → Environment Variables):
 - `ORACLE_PRIVATE_KEY` = signer allowed to call `awardCreditsBatch` (needed for automatic settlement)
 - `BATCH_INTERVAL_MS` (optional) = how often to flush pending credits (default 3600000 ms = 1 hour)
  - `PROTOCOL_INVITE_SECRET` = shared secret used by your backend to call `/invite`
- - `MS_TENANT_ID` (optional) = Azure AD tenant ID for Microsoft Graph (for Excel logging)
- - `MS_CLIENT_ID` (optional) = Azure AD application (client) ID
- - `MS_CLIENT_SECRET` (optional) = Azure AD application client secret
- - `MS_EXCEL_FILE_ID` (optional) = OneDrive/SharePoint drive item ID of the Excel file to log invites into
- - `MS_EXCEL_WORKSHEET_NAME` (optional) = Worksheet name in that Excel file (default `Invites`)
- - `MS_EXCEL_TABLE_NAME` (optional) = Table name within that worksheet (default `Table1`; table must already exist)
+ - `MS_TENANT_ID` = Azure AD tenant ID for Microsoft Graph (required for Excel-based invite system)
+ - `MS_CLIENT_ID` = Azure AD application (client) ID (required for Excel-based invite system)
+ - `MS_CLIENT_SECRET` = Azure AD application client secret (required for Excel-based invite system)
+ - `MS_EXCEL_FILE_ID` = OneDrive/SharePoint drive item ID of the Excel file containing invite codes (required)
+ - `MS_EXCEL_WORKSHEET_NAME` = Worksheet name in that Excel file (default `Invites`)
+ - `MS_EXCEL_TABLE_NAME` = Table name within that worksheet (default `Table1`; table must already exist)
+ - `MS_USER_ID` = User ID or UPN (e.g., `pavan.kumar@asvalabs.com`) for app-only auth to access Excel file (required if using app-only auth)
 
 Local `.env` example (for `npm start`):
 ```
@@ -396,8 +413,9 @@ MS_TENANT_ID=<azure-ad-tenant-id>
 MS_CLIENT_ID=<azure-ad-app-client-id>
 MS_CLIENT_SECRET=<azure-ad-app-client-secret>
 MS_EXCEL_FILE_ID=<excel-file-drive-item-id>
-MS_EXCEL_WORKSHEET_NAME=Invites
-MS_EXCEL_TABLE_NAME=Table1
+MS_EXCEL_WORKSHEET_NAME=in
+MS_EXCEL_TABLE_NAME=Invites
+MS_USER_ID=pavan.kumar@asvalabs.com
 ```
 
 ## Local run
