@@ -148,13 +148,37 @@ async function getExcelTableRows() {
 
 // Find invite code row in Excel
 async function findInviteCodeInExcel(code) {
+  const codeTrimmed = code.trim().toLowerCase();
+  console.log(`[excel] Searching for code: "${codeTrimmed}"`);
+  
   const rows = await getExcelTableRows();
-  if (!rows || !rows.length) return null;
+  if (!rows) {
+    console.error('[excel] Failed to get Excel table rows');
+    return null;
+  }
+  
+  if (!rows.length) {
+    console.warn('[excel] Excel table is empty or no rows found');
+    return null;
+  }
+  
+  console.log(`[excel] Found ${rows.length} rows in Excel table`);
   
   // Find row where first column (code) matches
-  for (const row of rows) {
+  // Note: Excel table rows may include header row, so we check all rows
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
     const values = row.values || [];
-    if (values[0] && values[0].toString().trim().toLowerCase() === code.trim().toLowerCase()) {
+    const rowCode = values[0] ? values[0].toString().trim().toLowerCase() : '';
+    
+    // Skip header row if it contains "code" as first value
+    if (i === 0 && rowCode === 'code') {
+      console.log('[excel] Skipping header row');
+      continue;
+    }
+    
+    if (rowCode && rowCode === codeTrimmed) {
+      console.log(`[excel] Found matching code at row index ${row.index}`);
       return {
         index: row.index,
         values: values,
@@ -167,6 +191,17 @@ async function findInviteCodeInExcel(code) {
       };
     }
   }
+  
+  console.warn(`[excel] Code "${codeTrimmed}" not found in Excel table`);
+  // Log first few codes for debugging
+  if (rows.length > 0) {
+    const sampleCodes = rows.slice(0, 3).map(r => {
+      const v = r.values || [];
+      return v[0] ? v[0].toString().trim() : '(empty)';
+    });
+    console.log(`[excel] Sample codes in Excel: ${sampleCodes.join(', ')}`);
+  }
+  
   return null;
 }
 
@@ -1663,6 +1698,63 @@ if (BATCH_INTERVAL_MS > 0) {
 }
 
 // Health
+// Debug endpoint to list invite codes from Excel (first 10)
+app.get('/invite/debug', async (_req, res) => {
+  try {
+    if (!MS_EXCEL_FILE_ID) {
+      return res.status(500).json({ error: 'excel_not_configured' });
+    }
+    
+    const rows = await getExcelTableRows();
+    if (!rows || !rows.length) {
+      return res.json({ 
+        error: 'no_rows_found',
+        message: 'Excel table is empty or could not be read',
+        rowCount: 0,
+        codes: []
+      });
+    }
+    
+    // Extract codes from rows (skip header if present)
+    const codes = [];
+    for (let i = 0; i < Math.min(rows.length, 10); i++) {
+      const row = rows[i];
+      const values = row.values || [];
+      const code = values[0] ? values[0].toString().trim() : '';
+      
+      // Skip header row
+      if (i === 0 && code.toLowerCase() === 'code') {
+        continue;
+      }
+      
+      if (code) {
+        codes.push({
+          code: code,
+          assignedTo: values[1] || '',
+          usedBy: values[2] || '',
+          usedAt: values[3] || '',
+          referrer: values[4] || ''
+        });
+      }
+    }
+    
+    return res.json({
+      success: true,
+      rowCount: rows.length,
+      sampleCodes: codes,
+      excelConfig: {
+        fileId: MS_EXCEL_FILE_ID,
+        worksheetName: MS_EXCEL_WORKSHEET_NAME,
+        tableName: MS_EXCEL_TABLE_NAME,
+        userId: MS_USER_ID || 'not_set'
+      }
+    });
+  } catch (e) {
+    console.error('[invite/debug] Error:', e.message || e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/health', (_req, res) => {
   res.json(serialize({ status: 'ok' }));
 });
