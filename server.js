@@ -2891,7 +2891,7 @@ app.post('/referral/redeem', async (req, res) => {
     const referralCodeTrimmed = code.trim();
     const inviteCodeTrimmed = inviteCode.trim();
 
-    // Step 1: Check invite code in Excel
+    // Step 1: Check and validate invite code in Excel
     if (!MS_EXCEL_FILE_ID) {
       return res.status(500).json({ error: 'excel_not_configured' });
     }
@@ -2901,9 +2901,37 @@ app.post('/referral/redeem', async (req, res) => {
       return res.status(400).json({ error: 'invalid_invite_code_not_found_in_excel' });
     }
 
-    // Verify invite code is assigned to this user
-    if (!excelRow.usedBy || excelRow.usedBy.trim() !== normalizedNew) {
-      return res.status(400).json({ error: 'invite_code_not_assigned_to_this_user' });
+    // Check if code is already used by someone else
+    if (excelRow.usedBy && excelRow.usedBy.trim() && excelRow.usedBy.trim() !== normalizedNew) {
+      return res.status(400).json({ error: 'invite_code_already_used_by_another_user' });
+    }
+
+    // Check if code is assigned to a specific user and validate
+    if (excelRow.assignedTo && excelRow.assignedTo.trim()) {
+      const assignedAddr = normalizeHexAddress(excelRow.assignedTo.trim());
+      if (!assignedAddr || normalizeAddress(assignedAddr) !== normalizedNew) {
+        return res.status(403).json({ error: 'invite_code_not_assigned_to_this_user' });
+      }
+    }
+
+    // If invite code is not yet used, mark it as used now
+    if (!excelRow.usedBy || !excelRow.usedBy.trim()) {
+      const timestampIso = new Date().toISOString();
+      const updatedValues = [
+        excelRow.code,
+        excelRow.assignedTo,
+        normalizedNew, // usedBy
+        timestampIso, // usedAt
+        excelRow.referrer,
+        excelRow.notes || `Invited at ${timestampIso}`
+      ];
+      
+      const updated = await updateExcelTableRow(excelRow.index, updatedValues);
+      if (!updated) {
+        console.error('[referral/redeem] Failed to update Excel row for invite code:', inviteCodeTrimmed);
+        return res.status(500).json({ error: 'failed_to_update_invite_code' });
+      }
+      console.log(`[referral/redeem] Marked invite code ${inviteCodeTrimmed} as used by ${normalizedNew}`);
     }
 
     // Step 2: Find referrer by referral code in Neo4j
@@ -3031,14 +3059,27 @@ app.post('/referral/redeem', async (req, res) => {
       engagementStore.recordEngagement(newEngagement)
     ]);
 
-    // Update Excel with redemption info (including referrer from referral code)
-    const excelUpdated = await logRedemptionToExcel({
-      code: inviteCodeTrimmed,
-      referrer: normalizedReferrer,
-      referred: normalizedNew
-    });
-    if (!excelUpdated) {
-      console.warn('[referral/redeem] Failed to update Excel for invite code:', inviteCodeTrimmed);
+    // Update Excel with redemption info - set referrer address from referral code
+    const excelRowForUpdate = await findInviteCodeInExcel(inviteCodeTrimmed);
+    if (excelRowForUpdate) {
+      const timestampIso = new Date().toISOString();
+      const redemptionNote = `Redeemed at ${timestampIso} - Referrer: ${normalizedReferrer}, Referred: ${normalizedNew}`;
+      
+      const updatedValues = [
+        excelRowForUpdate.code,
+        excelRowForUpdate.assignedTo,
+        normalizedNew, // usedBy
+        timestampIso, // usedAt (redemption timestamp)
+        normalizedReferrer, // referrer - set from referral code
+        (excelRowForUpdate.notes ? excelRowForUpdate.notes + '; ' : '') + redemptionNote
+      ];
+      
+      const excelUpdated = await updateExcelTableRow(excelRowForUpdate.index, updatedValues);
+      if (!excelUpdated) {
+        console.warn('[referral/redeem] Failed to update Excel for invite code:', inviteCodeTrimmed);
+      } else {
+        console.log(`[referral/redeem] Updated Excel row for invite code ${inviteCodeTrimmed} with referrer ${normalizedReferrer}`);
+      }
     }
 
     return res.json(serialize({
