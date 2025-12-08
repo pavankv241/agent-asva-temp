@@ -146,6 +146,32 @@ async function getExcelTableRows() {
   }
 }
 
+// Helper to extract code from Excel cell (handles CSV format where entire row might be in first cell)
+function extractCodeFromCell(cellValue) {
+  if (!cellValue) return '';
+  const str = cellValue.toString().trim();
+  // If cell contains commas, it's likely CSV format - extract first part before comma
+  if (str.includes(',')) {
+    return str.split(',')[0].trim();
+  }
+  return str;
+}
+
+// Helper to parse CSV row into columns
+function parseCSVRow(cellValue) {
+  if (!cellValue) return ['', '', '', '', '', ''];
+  const str = cellValue.toString().trim();
+  const parts = str.split(',');
+  return [
+    parts[0]?.trim() || '',
+    parts[1]?.trim() || '',
+    parts[2]?.trim() || '',
+    parts[3]?.trim() || '',
+    parts[4]?.trim() || '',
+    parts[5]?.trim() || ''
+  ];
+}
+
 // Find invite code row in Excel
 async function findInviteCodeInExcel(code) {
   const codeTrimmed = code.trim().toLowerCase();
@@ -169,25 +195,46 @@ async function findInviteCodeInExcel(code) {
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const values = row.values || [];
-    const rowCode = values[0] ? values[0].toString().trim().toLowerCase() : '';
+    const firstCell = values[0] ? values[0].toString().trim() : '';
     
     // Skip header row if it contains "code" as first value
-    if (i === 0 && rowCode === 'code') {
+    if (i === 0 && firstCell.toLowerCase().includes('code')) {
       console.log('[excel] Skipping header row');
       continue;
     }
     
+    // Extract code from cell (handles CSV format)
+    const rowCode = extractCodeFromCell(firstCell).toLowerCase();
+    
     if (rowCode && rowCode === codeTrimmed) {
       console.log(`[excel] Found matching code at row index ${row.index}`);
+      
+      // Parse the row - if first cell contains CSV, parse it; otherwise use values array
+      let parsedValues;
+      if (firstCell.includes(',')) {
+        // CSV format - parse the first cell
+        parsedValues = parseCSVRow(firstCell);
+      } else {
+        // Normal format - use values array
+        parsedValues = [
+          values[0] || '',
+          values[1] || '',
+          values[2] || '',
+          values[3] || '',
+          values[4] || '',
+          values[5] || ''
+        ];
+      }
+      
       return {
         index: row.index,
-        values: values,
-        code: values[0],
-        assignedTo: values[1] || '',
-        usedBy: values[2] || '',
-        usedAt: values[3] || '',
-        referrer: values[4] || '',
-        notes: values[5] || ''
+        values: parsedValues,
+        code: parsedValues[0],
+        assignedTo: parsedValues[1],
+        usedBy: parsedValues[2],
+        usedAt: parsedValues[3],
+        referrer: parsedValues[4],
+        notes: parsedValues[5]
       };
     }
   }
@@ -197,7 +244,8 @@ async function findInviteCodeInExcel(code) {
   if (rows.length > 0) {
     const sampleCodes = rows.slice(0, 3).map(r => {
       const v = r.values || [];
-      return v[0] ? v[0].toString().trim() : '(empty)';
+      const firstCell = v[0] ? v[0].toString().trim() : '';
+      return extractCodeFromCell(firstCell);
     });
     console.log(`[excel] Sample codes in Excel: ${sampleCodes.join(', ')}`);
   }
@@ -1720,20 +1768,36 @@ app.get('/invite/debug', async (_req, res) => {
     for (let i = 0; i < Math.min(rows.length, 10); i++) {
       const row = rows[i];
       const values = row.values || [];
-      const code = values[0] ? values[0].toString().trim() : '';
+      const firstCell = values[0] ? values[0].toString().trim() : '';
       
       // Skip header row
-      if (i === 0 && code.toLowerCase() === 'code') {
+      if (i === 0 && firstCell.toLowerCase().includes('code')) {
         continue;
       }
       
+      // Extract code and parse CSV if needed
+      const code = extractCodeFromCell(firstCell);
       if (code) {
+        let parsedValues;
+        if (firstCell.includes(',')) {
+          parsedValues = parseCSVRow(firstCell);
+        } else {
+          parsedValues = [
+            values[0] || '',
+            values[1] || '',
+            values[2] || '',
+            values[3] || '',
+            values[4] || '',
+            values[5] || ''
+          ];
+        }
+        
         codes.push({
-          code: code,
-          assignedTo: values[1] || '',
-          usedBy: values[2] || '',
-          usedAt: values[3] || '',
-          referrer: values[4] || ''
+          code: parsedValues[0],
+          assignedTo: parsedValues[1],
+          usedBy: parsedValues[2],
+          usedAt: parsedValues[3],
+          referrer: parsedValues[4]
         });
       }
     }
@@ -2808,81 +2872,69 @@ app.post('/invite', async (req, res) => {
   }
 });
 
-// Redeem a referral code for a new user, crediting both referrer and referred via engagement pipeline
-// Now checks Excel for invite code validation
+// Redeem a referral code (ASV-XXX format) AND invite code (Excel) for a new user
+// Requires BOTH: referral code from Neo4j (user A's code) AND invite code from Excel
 app.post('/referral/redeem', async (req, res) => {
   try {
-    const { code, newUser } = req.body || {};
+    const { code, inviteCode, newUser } = req.body || {};
     if (typeof code !== 'string' || !code.trim()) {
-      return res.status(400).json({ error: 'code required' });
+      return res.status(400).json({ error: 'referral_code_required' });
+    }
+    if (typeof inviteCode !== 'string' || !inviteCode.trim()) {
+      return res.status(400).json({ error: 'invite_code_required' });
     }
     const checksumNewUser = normalizeHexAddress(newUser);
     if (!checksumNewUser) return res.status(400).json({ error: 'valid newUser address required' });
     if (!referralStore) return res.status(500).json({ error: 'referral store not configured' });
 
     const normalizedNew = normalizeAddress(checksumNewUser);
-    const codeTrimmed = code.trim();
+    const referralCodeTrimmed = code.trim();
+    const inviteCodeTrimmed = inviteCode.trim();
 
-    // Check Excel for invite code
-    const excelRow = await findInviteCodeInExcel(codeTrimmed);
+    // Step 1: Check invite code in Excel
+    if (!MS_EXCEL_FILE_ID) {
+      return res.status(500).json({ error: 'excel_not_configured' });
+    }
+    
+    const excelRow = await findInviteCodeInExcel(inviteCodeTrimmed);
     if (!excelRow) {
-      return res.status(400).json({ error: 'invalid_code_not_found' });
+      return res.status(400).json({ error: 'invalid_invite_code_not_found_in_excel' });
     }
 
-    // Verify code is used by this user
+    // Verify invite code is assigned to this user
     if (!excelRow.usedBy || excelRow.usedBy.trim() !== normalizedNew) {
-      return res.status(400).json({ error: 'code_not_assigned_to_this_user' });
+      return res.status(400).json({ error: 'invite_code_not_assigned_to_this_user' });
     }
 
-    // Get referrer from Excel row (if set)
-    // Note: Referrer can be set in Excel or determined at redemption time
-    const referrerAddr = excelRow.referrer && excelRow.referrer.trim() 
-      ? normalizeAddress(normalizeHexAddress(excelRow.referrer.trim()))
-      : null;
-
-    // If no referrer in Excel, we can't create a referral relationship
-    // But we can still credit the new user for being referred
-    if (!referrerAddr) {
-      // No referrer - just credit the new user
-      const oracle = getOracle();
-      const referredCredits = oracle.getActionCredit('referral_you_are_referred') || 0;
+    // Step 2: Find referrer by referral code in Neo4j
+    // Referral codes are in format ASV-XXXXXX and stored in Neo4j
+    const session = referralStore.driver.session();
+    let referrerAddr = null;
+    try {
+      const result = await session.executeRead(tx =>
+        tx.run(
+          `
+          MATCH (referrer:User)-[:HAS_REFERRAL_CODE]->(c:ReferralCode {code: $code})
+          RETURN referrer.address AS referrerAddress
+          `,
+          { code: referralCodeTrimmed }
+        )
+      );
       
-      if (referredCredits <= 0) {
-        return res.status(500).json({ error: 'referral actions not configured' });
+      if (result.records.length === 0) {
+        return res.status(400).json({ error: 'invalid_referral_code_not_found' });
       }
+      
+      referrerAddr = normalizeAddress(result.records[0].get('referrerAddress'));
+    } catch (err) {
+      console.error('[referral/redeem] Error finding referral code:', err.message || err);
+      return res.status(500).json({ error: 'failed_to_lookup_referral_code' });
+    } finally {
+      await session.close();
+    }
 
-      const now = Date.now();
-      const newEngagement = {
-        id: randomUUID(),
-        address: normalizedNew,
-        action: 'referral_you_are_referred',
-        credits: referredCredits,
-        xp: referredCredits * 2,
-        metadata: { code: codeTrimmed },
-        createdAt: now
-      };
-
-      const newResult = await engagementStore.recordEngagement(newEngagement);
-
-      // Update Excel with redemption info
-      const excelUpdated = await logRedemptionToExcel({
-        code: codeTrimmed,
-        referrer: '',
-        referred: normalizedNew
-      });
-      if (!excelUpdated) {
-        console.warn('[referral/redeem] Failed to update Excel for code:', codeTrimmed);
-      }
-
-      return res.json(serialize({
-        referrer: null,
-        referred: {
-          address: newEngagement.address,
-          credits: newEngagement.credits,
-          xp: newEngagement.xp,
-          pendingCredits: newResult.pendingCredits
-        }
-      }));
+    if (!referrerAddr) {
+      return res.status(400).json({ error: 'referrer_not_found_for_code' });
     }
 
     // Normalize referrer address
@@ -2892,14 +2944,57 @@ app.post('/referral/redeem', async (req, res) => {
       return res.status(400).json({ error: 'self_referral_not_allowed' });
     }
 
-    // Check if referral already exists in Neo4j
-    const existingMapping = await referralStore.isAllowedReferral(normalizedReferrer, normalizedNew);
-    if (existingMapping) {
+    // Check if referral relationship already exists in Neo4j
+    const sessionCheck = referralStore.driver.session();
+    let referralExists = false;
+    try {
+      const checkResult = await sessionCheck.executeRead(tx =>
+        tx.run(
+          `
+          MATCH (referrer:User {address: $referrer})-[r:REFERRED]->(newUser:User {address: $newUser})
+          RETURN r
+          `,
+          { referrer: normalizedReferrer, newUser: normalizedNew }
+        )
+      );
+      referralExists = checkResult.records.length > 0;
+    } catch (err) {
+      console.error('[referral/redeem] Error checking existing referral:', err.message || err);
+    } finally {
+      await sessionCheck.close();
+    }
+    
+    if (referralExists) {
       return res.status(400).json({ error: 'referral_already_exists' });
     }
 
-    // Create referral relationship in Neo4j (if referralStore supports it)
-    // For now, we'll just record the engagement and log to Excel
+    // Check if referrer has allowed this new user (allow-list check)
+    const isAllowed = await referralStore.isAllowedReferral(normalizedReferrer, normalizedNew);
+    if (!isAllowed) {
+      return res.status(400).json({ error: 'referral_not_allowed_by_referrer' });
+    }
+
+    // Create referral relationship in Neo4j
+    const session2 = referralStore.driver.session();
+    try {
+      await session2.executeWrite(tx =>
+        tx.run(
+          `
+          MERGE (referrer:User {address: $referrer})
+          MERGE (newUser:User {address: $newUser})
+          MERGE (referrer)-[r:REFERRED]->(newUser)
+          ON CREATE SET r.createdAtMs = timestamp()
+          RETURN r
+          `,
+          { referrer: normalizedReferrer, newUser: normalizedNew }
+        )
+      );
+    } catch (err) {
+      console.error('[referral/redeem] Error creating referral relationship:', err.message || err);
+      // Continue anyway - we'll still credit the users
+    } finally {
+      await session2.close();
+    }
 
     const oracle = getOracle();
     const refCredits = oracle.getActionCredit('referral_you_refer') || 0;
@@ -2917,7 +3012,7 @@ app.post('/referral/redeem', async (req, res) => {
       action: 'referral_you_refer',
       credits: refCredits,
       xp: refCredits * 2,
-      metadata: { referred: normalizedNew, code: codeTrimmed },
+      metadata: { referred: normalizedNew, referralCode: referralCodeTrimmed, inviteCode: inviteCodeTrimmed },
       createdAt: now
     };
 
@@ -2927,7 +3022,7 @@ app.post('/referral/redeem', async (req, res) => {
       action: 'referral_you_are_referred',
       credits: referredCredits,
       xp: referredCredits * 2,
-      metadata: { referrer: normalizedReferrer, code: codeTrimmed },
+      metadata: { referrer: normalizedReferrer, referralCode: referralCodeTrimmed, inviteCode: inviteCodeTrimmed },
       createdAt: now
     };
 
@@ -2936,14 +3031,14 @@ app.post('/referral/redeem', async (req, res) => {
       engagementStore.recordEngagement(newEngagement)
     ]);
 
-    // Update Excel with redemption info (including referrer)
+    // Update Excel with redemption info (including referrer from referral code)
     const excelUpdated = await logRedemptionToExcel({
-      code: codeTrimmed,
+      code: inviteCodeTrimmed,
       referrer: normalizedReferrer,
       referred: normalizedNew
     });
     if (!excelUpdated) {
-      console.warn('[referral/redeem] Failed to update Excel for code:', codeTrimmed);
+      console.warn('[referral/redeem] Failed to update Excel for invite code:', inviteCodeTrimmed);
     }
 
     return res.json(serialize({
