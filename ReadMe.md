@@ -39,21 +39,64 @@ const { cost } = await res.json();
 ```
 
 ### POST `/inference/authorize`
-- Read-mostly helper to decide if a user can run an inference now, and whether it would bill subscription or credits. Also updates Neo4j with the decremented remaining quota for the user's plan (shared pool across allowed modes) and off‑chain credit usage.
+- **Authorization check only** - Called before submitting query to AI MCP server to verify if user is allowed to run inference.
+- Does NOT update any off-chain state. State updates are handled by `/inference/record` after successful AI inference.
 - Body params (JSON):
   - `user` (string, 0x-address)
   - `mode` (string, optional): `basic | tags | price_accuracy | full` (defaults to `basic` if omitted)
   - `quantity` (number, optional, default 1)
   - `reason` (string, optional): same as in `/inference/estimate`; used to determine the precise credit cost if/when the request falls back to credits.
-  - `tags` (boolean, optional): when `true`, forces pricing to include tags even if the free‑text `reason` doesn’t explicitly contain the word “tags`.
+  - `tags` (boolean, optional): when `true`, forces pricing to include tags even if the free‑text `reason` doesn't explicitly contain the word "tags`.
+  - `contextHash` (string, optional): context hash for tracking
 - Returns: `{ allowed, method: 'subscription'|'credits'|'initial_grant'|'deny', reason, cost, ... }`
+- Frontend workflow:
+```js
+// 1. Check authorization before AI call
+const authRes = await fetch('/inference/authorize', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ user, mode: 'basic', quantity: 1, reason: 'tags_price_accuracy_basic', tags: true })
+});
+const authDecision = await authRes.json();
+
+if (!authDecision.allowed) {
+  // Show error to user
+  return;
+}
+
+// 2. If authorized, proceed with AI inference
+const aiResponse = await fetch('/ai-mcp-server/query', {
+  method: 'POST',
+  body: JSON.stringify({ query: '...' })
+});
+
+// 3. After successful AI response, record the usage
+if (aiResponse.ok) {
+  await fetch('/inference/record', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user, mode: 'basic', quantity: 1, reason: 'tags_price_accuracy_basic', tags: true })
+  });
+}
+```
+
+### POST `/inference/record`
+- **Billing decision, over-spending prevention, and state updates** - Called after successful AI inference response.
+- Handles billing method decision, prevents over-spending by checking pending usage, and updates Neo4j with decremented remaining quota and off‑chain credit usage.
+- Body params (JSON): Same as `/inference/authorize`
+  - `user` (string, 0x-address)
+  - `mode` (string, optional): `basic | tags | price_accuracy | full` (defaults to `basic` if omitted)
+  - `quantity` (number, optional, default 1)
+  - `reason` (string, optional): same as in `/inference/estimate`
+  - `tags` (boolean, optional): when `true`, forces pricing to include tags
+  - `contextHash` (string, optional): context hash for tracking
+- Returns: `{ success: true, allowed, method: 'subscription'|'credits'|'initial_grant', reason, cost, ... }`
 - Frontend :
 ```js
-const res = await fetch('/inference/authorize', {
+// Called after successful AI inference
+const res = await fetch('/inference/record', {
   method: 'POST', headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ user, reason: 'tags_price_accuracy_basic', tags: true })
+  body: JSON.stringify({ user, mode: 'basic', quantity: 1, reason: 'tags_price_accuracy_basic', tags: true })
 });
-const decision = await res.json();
+const result = await res.json(); // { success: true, ... }
 ```
 
 ### GET `/users/:address/credits`
@@ -331,10 +374,12 @@ Set env vars (Vercel → Project → Settings → Environment Variables):
 - `ORACLE_PRIVATE_KEY` = signer allowed to call `awardCreditsBatch` (needed for automatic settlement)
 - `BATCH_INTERVAL_MS` (optional) = how often to flush pending credits (default 3600000 ms = 1 hour)
  - `PROTOCOL_INVITE_SECRET` = shared secret used by your backend to call `/invite`
- - `SHEETS_SPREADSHEET_ID` (optional) = Google Sheets spreadsheet ID to log invites
- - `SHEETS_INVITE_TAB_NAME` (optional) = Sheet/tab name inside the spreadsheet (default `Invites`)
- - `GOOGLE_SERVICE_ACCOUNT_EMAIL` (optional) = service account email with edit access to the sheet
- - `GOOGLE_PRIVATE_KEY` (optional) = private key from the service account JSON (with `\n`-escaped newlines)
+ - `MS_TENANT_ID` (optional) = Azure AD tenant ID for Microsoft Graph (for Excel logging)
+ - `MS_CLIENT_ID` (optional) = Azure AD application (client) ID
+ - `MS_CLIENT_SECRET` (optional) = Azure AD application client secret
+ - `MS_EXCEL_FILE_ID` (optional) = OneDrive/SharePoint drive item ID of the Excel file to log invites into
+ - `MS_EXCEL_WORKSHEET_NAME` (optional) = Worksheet name in that Excel file (default `Invites`)
+ - `MS_EXCEL_TABLE_NAME` (optional) = Table name within that worksheet (default `Table1`; table must already exist)
 
 Local `.env` example (for `npm start`):
 ```
@@ -347,10 +392,12 @@ NEO4J_PASSWORD=GvvDuPnpTTfr0mOVgKhINbbstnztdzqAaSfrCxuHKeI
 ORACLE_PRIVATE_KEY=<hex private key of oracle signer>
 BATCH_INTERVAL_MS=3600000
 PROTOCOL_INVITE_SECRET=<random-long-secret>
-SHEETS_SPREADSHEET_ID=<google-sheets-id>
-SHEETS_INVITE_TAB_NAME=Invites
-GOOGLE_SERVICE_ACCOUNT_EMAIL=<service-account-email>
-GOOGLE_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n
+MS_TENANT_ID=<azure-ad-tenant-id>
+MS_CLIENT_ID=<azure-ad-app-client-id>
+MS_CLIENT_SECRET=<azure-ad-app-client-secret>
+MS_EXCEL_FILE_ID=<excel-file-drive-item-id>
+MS_EXCEL_WORKSHEET_NAME=Invites
+MS_EXCEL_TABLE_NAME=Table1
 ```
 
 ## Local run
