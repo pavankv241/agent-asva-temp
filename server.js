@@ -43,6 +43,7 @@ const MS_CLIENT_SECRET = process.env.MS_CLIENT_SECRET || null;
 const MS_EXCEL_FILE_ID = process.env.MS_EXCEL_FILE_ID || null;
 const MS_EXCEL_WORKSHEET_NAME = process.env.MS_EXCEL_WORKSHEET_NAME || 'Invites';
 const MS_EXCEL_TABLE_NAME = process.env.MS_EXCEL_TABLE_NAME || 'Table1';
+const MS_USER_ID = process.env.MS_USER_ID || null; // User ID or UPN for app-only auth (e.g., pavan.kumar@asvalabs.com)
 
 // Helper: JSON-safe serializer for BigInt
 function serialize(value) {
@@ -101,36 +102,152 @@ async function getMsGraphAccessToken() {
   }
 }
 
-async function logInviteToExcel({ referrer, newUser, code, inviteToken }) {
-  if (!MS_EXCEL_FILE_ID) return;
-  const token = await getMsGraphAccessToken();
-  if (!token) return;
-  try {
-    const timestampIso = new Date().toISOString();
-    const url = `https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(
-      MS_EXCEL_FILE_ID
-    )}/workbook/worksheets('${encodeURIComponent(
-      MS_EXCEL_WORKSHEET_NAME
-    )}')/tables('${encodeURIComponent(MS_EXCEL_TABLE_NAME)}')/rows/add`;
+// Get Excel API base URL (supports app-only auth)
+function getExcelApiBase() {
+  if (!MS_EXCEL_FILE_ID) return null;
+  // For app-only auth, use /users/{userId}/drive instead of /me/drive
+  if (MS_USER_ID) {
+    return `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(MS_USER_ID)}/drive/items/${encodeURIComponent(MS_EXCEL_FILE_ID)}`;
+  }
+  // Fallback to /me for delegated auth
+  return `https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(MS_EXCEL_FILE_ID)}`;
+}
 
+// Read all rows from Excel table
+async function getExcelTableRows() {
+  if (!MS_EXCEL_FILE_ID) return null;
+  const token = await getMsGraphAccessToken();
+  if (!token) return null;
+  try {
+    const base = getExcelApiBase();
+    if (!base) return null;
+    const url = `${base}/workbook/worksheets('${encodeURIComponent(
+      MS_EXCEL_WORKSHEET_NAME
+    )}')/tables('${encodeURIComponent(MS_EXCEL_TABLE_NAME)}')/rows`;
+    
     const resp = await fetch(url, {
-      method: 'POST',
+      method: 'GET',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        values: [[timestampIso, referrer || '', newUser || '', code || '', inviteToken || '']]
-      })
+      }
     });
 
     if (!resp.ok) {
       const text = await resp.text();
-      console.error('[excel] Failed to append invite row:', resp.status, text);
+      console.error('[excel] Failed to read table rows:', resp.status, text);
+      return null;
     }
+    const data = await resp.json();
+    return data.value || [];
   } catch (err) {
-    console.error('[excel] Error logging invite to Excel:', err.message || err);
+    console.error('[excel] Error reading table rows:', err.message || err);
+    return null;
   }
+}
+
+// Find invite code row in Excel
+async function findInviteCodeInExcel(code) {
+  const rows = await getExcelTableRows();
+  if (!rows || !rows.length) return null;
+  
+  // Find row where first column (code) matches
+  for (const row of rows) {
+    const values = row.values || [];
+    if (values[0] && values[0].toString().trim().toLowerCase() === code.trim().toLowerCase()) {
+      return {
+        index: row.index,
+        values: values,
+        code: values[0],
+        assignedTo: values[1] || '',
+        usedBy: values[2] || '',
+        usedAt: values[3] || '',
+        referrer: values[4] || '',
+        notes: values[5] || ''
+      };
+    }
+  }
+  return null;
+}
+
+// Update a row in Excel table
+async function updateExcelTableRow(rowIndex, values) {
+  if (!MS_EXCEL_FILE_ID) return false;
+  const token = await getMsGraphAccessToken();
+  if (!token) return false;
+  try {
+    const base = getExcelApiBase();
+    if (!base) return false;
+    const url = `${base}/workbook/worksheets('${encodeURIComponent(
+      MS_EXCEL_WORKSHEET_NAME
+    )}')/tables('${encodeURIComponent(MS_EXCEL_TABLE_NAME)}')/rows/itemAt(index=${rowIndex})`;
+    
+    const resp = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ values: [values] })
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error('[excel] Failed to update row:', resp.status, text);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[excel] Error updating row:', err.message || err);
+    return false;
+  }
+}
+
+// Log redemption to Excel - updates the invite row with redemption info
+async function logRedemptionToExcel({ code, referrer, referred }) {
+  const row = await findInviteCodeInExcel(code);
+  if (!row) {
+    console.error('[excel] Code not found for redemption:', code);
+    return false;
+  }
+  
+  const timestampIso = new Date().toISOString();
+  const redemptionNote = referrer 
+    ? `Redeemed at ${timestampIso} - Referrer: ${referrer}, Referred: ${referred}`
+    : `Redeemed at ${timestampIso} - Referred: ${referred}`;
+  
+  const updatedValues = [
+    row.code,
+    row.assignedTo,
+    referred, // usedBy - the person who redeemed
+    timestampIso, // usedAt - redemption timestamp
+    referrer || row.referrer || '', // referrer - set if provided
+    (row.notes ? row.notes + '; ' : '') + redemptionNote // notes - append redemption info
+  ];
+  
+  const success = await updateExcelTableRow(row.index, updatedValues);
+  if (!success) {
+    console.error('[excel] Failed to update Excel row for redemption:', code);
+  }
+  return success;
+}
+
+async function logInviteToExcel({ referrer, newUser, code, inviteToken }) {
+  // Legacy function - now we update the invite row directly
+  const row = await findInviteCodeInExcel(code);
+  if (!row) return;
+  
+  const timestampIso = new Date().toISOString();
+  const updatedValues = [
+    row.code,
+    row.assignedTo,
+    newUser,
+    timestampIso,
+    referrer || row.referrer,
+    row.notes || `Invited at ${timestampIso}`
+  ];
+  
+  await updateExcelTableRow(row.index, updatedValues);
 }
 
 function getProvider() {
@@ -2529,20 +2646,11 @@ app.post('/referral/code', async (req, res) => {
   }
 });
 
-// Protocol-side: create an invite token binding a referral code to a specific new user
-// Only callable by backend/protocol using shared secret header: x-protocol-key
+// Validate invite code from Excel and assign to a new user
+// Can be called directly from frontend
 // body: { code: string, newUser: string }
 app.post('/invite', async (req, res) => {
   try {
-    if (!PROTOCOL_INVITE_SECRET) {
-      return res.status(500).json({ error: 'invite secret not configured' });
-    }
-
-    const authKey = req.headers['x-protocol-key'];
-    if (!authKey || authKey !== PROTOCOL_INVITE_SECRET) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-
     const { code, newUser } = req.body || {};
     if (typeof code !== 'string' || !code.trim()) {
       return res.status(400).json({ error: 'code required' });
@@ -2551,70 +2659,155 @@ app.post('/invite', async (req, res) => {
     if (!checksumNewUser) {
       return res.status(400).json({ error: 'valid newUser address required' });
     }
-    if (!referralStore) {
-      return res.status(500).json({ error: 'referral store not configured' });
+
+    // Check if Excel is configured
+    if (!MS_EXCEL_FILE_ID) {
+      return res.status(500).json({ error: 'excel_not_configured' });
     }
 
     const normalizedNew = normalizeAddress(checksumNewUser);
-    const inviteToken = randomUUID().replace(/-/g, '');
+    const codeTrimmed = code.trim();
 
-    const invite = await referralStore.createInvite(code.trim(), normalizedNew, inviteToken);
-    if (!invite) {
-      return res.status(400).json({ error: 'invalid_code_or_referrer_not_found' });
+    // Check if code exists in Excel - MUST exist before proceeding
+    const excelRow = await findInviteCodeInExcel(codeTrimmed);
+    if (!excelRow) {
+      return res.status(400).json({ error: 'invalid_code_not_found_in_excel' });
     }
 
-    // Log to Microsoft Excel via Graph (best-effort, non-blocking for client)
-    logInviteToExcel({
-      referrer: invite.referrer,
-      newUser: normalizedNew,
-      code: code.trim(),
-      inviteToken: invite.token
-    }).catch(err => {
-      console.error('[invite] failed to log to Excel:', err.message || err);
-    });
+    // Check if code is already used
+    if (excelRow.usedBy && excelRow.usedBy.trim()) {
+      return res.status(400).json({ error: 'code_already_used' });
+    }
+
+    // Check if code is assigned to a specific user and validate
+    if (excelRow.assignedTo && excelRow.assignedTo.trim()) {
+      const assignedAddr = normalizeHexAddress(excelRow.assignedTo.trim());
+      if (!assignedAddr || normalizeAddress(assignedAddr) !== normalizedNew) {
+        return res.status(403).json({ error: 'code_not_assigned_to_this_user' });
+      }
+    }
+
+    // Mark code as used in Excel
+    const timestampIso = new Date().toISOString();
+    const updatedValues = [
+      excelRow.code,
+      excelRow.assignedTo,
+      normalizedNew, // usedBy
+      timestampIso, // usedAt
+      excelRow.referrer,
+      excelRow.notes || `Invited at ${timestampIso}`
+    ];
+    
+    const updated = await updateExcelTableRow(excelRow.index, updatedValues);
+    if (!updated) {
+      console.error('[invite] Failed to update Excel row for code:', codeTrimmed);
+      return res.status(500).json({ error: 'failed_to_update_invite_code' });
+    }
 
     return res.json(serialize({
-      code: code.trim(),
+      code: codeTrimmed,
       newUser: normalizedNew,
-      referrer: invite.referrer,
-      inviteToken: invite.token
+      referrer: excelRow.referrer || '',
+      usedAt: timestampIso
     }));
   } catch (e) {
+    console.error('[invite] Error:', e.message || e);
     return res.status(500).json({ error: e.message });
   }
 });
 
 // Redeem a referral code for a new user, crediting both referrer and referred via engagement pipeline
+// Now checks Excel for invite code validation
 app.post('/referral/redeem', async (req, res) => {
   try {
-    const { code, newUser, inviteToken } = req.body || {};
+    const { code, newUser } = req.body || {};
     if (typeof code !== 'string' || !code.trim()) {
       return res.status(400).json({ error: 'code required' });
-    }
-    if (typeof inviteToken !== 'string' || !inviteToken.trim()) {
-      return res.status(400).json({ error: 'inviteToken required' });
     }
     const checksumNewUser = normalizeHexAddress(newUser);
     if (!checksumNewUser) return res.status(400).json({ error: 'valid newUser address required' });
     if (!referralStore) return res.status(500).json({ error: 'referral store not configured' });
 
     const normalizedNew = normalizeAddress(checksumNewUser);
-    const mapping = await referralStore.redeemCode(code.trim(), normalizedNew, inviteToken.trim());
-    if (!mapping) {
-      return res.status(400).json({ error: 'invalid_code_invite_or_already_referred' });
-    }
-    const referrerAddr = mapping.referrer;
-    const referredAddr = mapping.referred;
+    const codeTrimmed = code.trim();
 
-    if (referrerAddr.toLowerCase() === referredAddr.toLowerCase()) {
+    // Check Excel for invite code
+    const excelRow = await findInviteCodeInExcel(codeTrimmed);
+    if (!excelRow) {
+      return res.status(400).json({ error: 'invalid_code_not_found' });
+    }
+
+    // Verify code is used by this user
+    if (!excelRow.usedBy || excelRow.usedBy.trim() !== normalizedNew) {
+      return res.status(400).json({ error: 'code_not_assigned_to_this_user' });
+    }
+
+    // Get referrer from Excel row (if set)
+    // Note: Referrer can be set in Excel or determined at redemption time
+    const referrerAddr = excelRow.referrer && excelRow.referrer.trim() 
+      ? normalizeAddress(normalizeHexAddress(excelRow.referrer.trim()))
+      : null;
+
+    // If no referrer in Excel, we can't create a referral relationship
+    // But we can still credit the new user for being referred
+    if (!referrerAddr) {
+      // No referrer - just credit the new user
+      const oracle = getOracle();
+      const referredCredits = oracle.getActionCredit('referral_you_are_referred') || 0;
+      
+      if (referredCredits <= 0) {
+        return res.status(500).json({ error: 'referral actions not configured' });
+      }
+
+      const now = Date.now();
+      const newEngagement = {
+        id: randomUUID(),
+        address: normalizedNew,
+        action: 'referral_you_are_referred',
+        credits: referredCredits,
+        xp: referredCredits * 2,
+        metadata: { code: codeTrimmed },
+        createdAt: now
+      };
+
+      const newResult = await engagementStore.recordEngagement(newEngagement);
+
+      // Update Excel with redemption info
+      const excelUpdated = await logRedemptionToExcel({
+        code: codeTrimmed,
+        referrer: '',
+        referred: normalizedNew
+      });
+      if (!excelUpdated) {
+        console.warn('[referral/redeem] Failed to update Excel for code:', codeTrimmed);
+      }
+
+      return res.json(serialize({
+        referrer: null,
+        referred: {
+          address: newEngagement.address,
+          credits: newEngagement.credits,
+          xp: newEngagement.xp,
+          pendingCredits: newResult.pendingCredits
+        }
+      }));
+    }
+
+    // Normalize referrer address
+    const normalizedReferrer = normalizeAddress(referrerAddr);
+
+    if (normalizedReferrer.toLowerCase() === normalizedNew.toLowerCase()) {
       return res.status(400).json({ error: 'self_referral_not_allowed' });
     }
 
-      // Enforce referrer allow-list: referrer must have explicitly allowed this new user
-      const isAllowed = await referralStore.isAllowedReferral(referrerAddr, normalizedNew);
-      if (!isAllowed) {
-        return res.status(400).json({ error: 'referral_not_allowed_by_referrer' });
-      }
+    // Check if referral already exists in Neo4j
+    const existingMapping = await referralStore.isAllowedReferral(normalizedReferrer, normalizedNew);
+    if (existingMapping) {
+      return res.status(400).json({ error: 'referral_already_exists' });
+    }
+
+    // Create referral relationship in Neo4j (if referralStore supports it)
+    // For now, we'll just record the engagement and log to Excel
 
     const oracle = getOracle();
     const refCredits = oracle.getActionCredit('referral_you_refer') || 0;
@@ -2628,21 +2821,21 @@ app.post('/referral/redeem', async (req, res) => {
 
     const refEngagement = {
       id: randomUUID(),
-      address: normalizeAddress(referrerAddr),
+      address: normalizedReferrer,
       action: 'referral_you_refer',
       credits: refCredits,
       xp: refCredits * 2,
-      metadata: { referred: referredAddr, code: code.trim() },
+      metadata: { referred: normalizedNew, code: codeTrimmed },
       createdAt: now
     };
 
     const newEngagement = {
       id: randomUUID(),
-      address: normalizeAddress(referredAddr),
+      address: normalizedNew,
       action: 'referral_you_are_referred',
       credits: referredCredits,
       xp: referredCredits * 2,
-      metadata: { referrer: referrerAddr, code: code.trim() },
+      metadata: { referrer: normalizedReferrer, code: codeTrimmed },
       createdAt: now
     };
 
@@ -2650,6 +2843,16 @@ app.post('/referral/redeem', async (req, res) => {
       engagementStore.recordEngagement(refEngagement),
       engagementStore.recordEngagement(newEngagement)
     ]);
+
+    // Update Excel with redemption info (including referrer)
+    const excelUpdated = await logRedemptionToExcel({
+      code: codeTrimmed,
+      referrer: normalizedReferrer,
+      referred: normalizedNew
+    });
+    if (!excelUpdated) {
+      console.warn('[referral/redeem] Failed to update Excel for code:', codeTrimmed);
+    }
 
     return res.json(serialize({
       referrer: {
@@ -2666,6 +2869,7 @@ app.post('/referral/redeem', async (req, res) => {
       }
     }));
   } catch (e) {
+    console.error('[referral/redeem] Error:', e.message || e);
     return res.status(500).json({ error: e.message });
   }
 });
