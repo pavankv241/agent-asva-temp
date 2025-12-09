@@ -17,7 +17,7 @@ Unless noted, endpoints are public read helpers. Oracle-only endpoints return ca
 
 ### GET `/health`
 - Purpose: simple liveness check.
-- Frontend 
+- Frontend
 ```js
 const res = await fetch('/health');
 const data = await res.json(); // { status: 'ok' }
@@ -265,6 +265,17 @@ const data = await res.json(); // { engagementId, address, action, credits, xp, 
   - `400 invalid_code_not_found_in_excel`: Code doesn't exist in Excel
   - `400 code_already_used`: Code was already assigned to another user
   - `403 code_not_assigned_to_this_user`: Code is assigned to a different address
+
+### GET `/invite/status/:address`
+- Purpose: Check if a wallet has already used an invite code (Excel lookup).
+- URL params:
+  - `address` (string, 0x-address)
+- Response: 
+  - If found: `{ address, hasUsedInvite: true, invite: { code, assignedTo, usedBy, usedAt, referrer, notes } }`
+- If not found: `{ address, hasUsedInvite: false, invite: null }`
+- Errors:
+  - `400 valid address required`
+  - `500 excel_not_configured`
 
 ### POST `/referral/redeem`
 - Purpose: redeem BOTH a **referral code** (ASV-XXX format from Neo4j) AND an **invite code** (from Excel) when a new user signs up. Requires both codes to complete the referral redemption. Creates referral relationship in Neo4j and credits both referrer and new user via engagement pipeline (`referral_you_refer` and `referral_you_are_referred`).
