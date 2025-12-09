@@ -253,6 +253,61 @@ async function findInviteCodeInExcel(code) {
   return null;
 }
 
+// Find an invite code row in Excel by the wallet that used it
+async function findInviteUsageByAddress(address) {
+  const checksumAddr = normalizeHexAddress(address);
+  if (!checksumAddr) return null;
+
+  const target = normalizeAddress(checksumAddr);
+  const rows = await getExcelTableRows();
+  if (!rows || !rows.length) {
+    return null;
+  }
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const values = row.values || [];
+    const firstCell = values[0] ? values[0].toString().trim() : '';
+
+    // Skip header row if present
+    if (i === 0 && firstCell.toLowerCase().includes('code')) {
+      continue;
+    }
+
+    let parsedValues;
+    if (firstCell.includes(',')) {
+      parsedValues = parseCSVRow(firstCell);
+    } else {
+      parsedValues = [
+        values[0] || '',
+        values[1] || '',
+        values[2] || '',
+        values[3] || '',
+        values[4] || '',
+        values[5] || ''
+      ];
+    }
+
+    const usedByCell = parsedValues[2] ? parsedValues[2].toString().trim() : '';
+    if (!usedByCell) continue;
+
+    const normalizedUsedBy = normalizeHexAddress(usedByCell);
+    if (normalizedUsedBy && normalizeAddress(normalizedUsedBy) === target) {
+      return {
+        index: row.index,
+        code: parsedValues[0],
+        assignedTo: parsedValues[1],
+        usedBy: normalizeAddress(normalizedUsedBy),
+        usedAt: parsedValues[3],
+        referrer: parsedValues[4],
+        notes: parsedValues[5]
+      };
+    }
+  }
+
+  return null;
+}
+
 // Update a row in Excel table
 async function updateExcelTableRow(rowIndex, values) {
   if (!MS_EXCEL_FILE_ID) return false;
@@ -1815,6 +1870,48 @@ app.get('/invite/debug', async (_req, res) => {
     });
   } catch (e) {
     console.error('[invite/debug] Error:', e.message || e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Check if a user address has already used an invite code (Excel lookup)
+app.get('/invite/status/:address', async (req, res) => {
+  try {
+    const { address } = req.params || {};
+    const checksumAddr = normalizeHexAddress(address);
+    if (!checksumAddr) {
+      return res.status(400).json({ error: 'valid address required' });
+    }
+
+    if (!MS_EXCEL_FILE_ID) {
+      return res.status(500).json({ error: 'excel_not_configured' });
+    }
+
+    const normalized = normalizeAddress(checksumAddr);
+    const inviteRow = await findInviteUsageByAddress(normalized);
+
+    if (!inviteRow) {
+      return res.json({
+        address: normalized,
+        hasUsedInvite: false,
+        invite: null
+      });
+    }
+
+    return res.json({
+      address: normalized,
+      hasUsedInvite: true,
+      invite: {
+        code: inviteRow.code,
+        assignedTo: inviteRow.assignedTo,
+        usedBy: inviteRow.usedBy,
+        usedAt: inviteRow.usedAt,
+        referrer: inviteRow.referrer,
+        notes: inviteRow.notes
+      }
+    });
+  } catch (e) {
+    console.error('[invite/status] Error:', e.message || e);
     return res.status(500).json({ error: e.message });
   }
 });
