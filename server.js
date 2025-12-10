@@ -2161,7 +2161,7 @@ async function getPendingSubscriptionUsage(address) {
 }
 
 // Tiny per-process TTL caches to avoid duplicate lookups during bursts
-const PENDING_CACHE_TTL_MS = 1_000;
+const PENDING_CACHE_TTL_MS = 4_000;
 const pendingUsageCache = new Map();
 const pendingCreditsCache = new Map();
 const pendingEngagementCache = new Map();
