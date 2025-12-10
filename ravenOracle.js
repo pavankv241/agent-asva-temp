@@ -87,7 +87,27 @@ class RavenOracle {
         this._rateLimiter = new Map(); // user -> timestamps[] (ms)
         this._grantedInitial = new Set(); // process-local one-time credit grant guard
 
+        // Small, per-process read cache to shave latency on hot paths
+        this.CACHE_TTL_MS = 5_000;
+        this._subscriptionCache = new Map(); // address -> { value, ts }
+        this._creditsCache = new Map(); // address -> { value, ts }
+
         // Plans now gate only monthly caps; any user may request any supported mode.
+    }
+
+    _fromCache(map, key) {
+        const entry = map.get(key);
+        if (!entry) return null;
+        if (Date.now() - entry.ts > this.CACHE_TTL_MS) {
+            map.delete(key);
+            return null;
+        }
+        return entry.value;
+    }
+
+    _storeCache(map, key, value) {
+        map.set(key, { value, ts: Date.now() });
+        return value;
     }
 
     // Update user memory pointer on-chain (requires signer)
@@ -326,6 +346,8 @@ class RavenOracle {
 
     // Get user subscription info from RavenAccess contract
     async getUserSubscription(userAddress) {
+        const cached = this._fromCache(this._subscriptionCache, userAddress);
+        if (cached) return cached;
         try {
             // Prefer direct view helper on contract (single call for most fields)
             const res = await this.ravenAccess.getUserSubscription(userAddress);
@@ -355,6 +377,7 @@ class RavenOracle {
                     active
                 }
             };
+            return this._storeCache(this._subscriptionCache, userAddress, out);
         } catch (error) {
             console.error('Error getting user subscription:', error);
             return null;
@@ -363,10 +386,12 @@ class RavenOracle {
 
     // Get user current credits
     async getUserCredits(userAddress) {
+        const cached = this._fromCache(this._creditsCache, userAddress);
+        if (cached) return cached;
         try {
             // Prefer direct view helper for credits
             const credits = await this.ravenAccess.getUserCredits(userAddress);
-            return credits.toString();
+            return this._storeCache(this._creditsCache, userAddress, credits.toString());
         } catch (error) {
             console.error('Error getting user credits:', error);
             return '0';
