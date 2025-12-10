@@ -26,6 +26,13 @@ function normalizeHexAddress(address) {
   }
 }
 
+function subscriptionEffectiveCap(subscription) {
+  if (!subscription) return 0;
+  const base = Number(subscription.plan?.monthlyCap ?? 0);
+  const rollover = Number(subscription.rolloverAllowance ?? 0);
+  return base + rollover;
+}
+
 // Env config
 const PORT = process.env.PORT || 8080;
 const RPC_URL = process.env.RPC_URL || 'https://sepolia.infura.io/v3/YOUR_INFURA_KEY';
@@ -2041,11 +2048,11 @@ async function recordInferenceUsageSnapshot({
       const subscription = await oracle.getUserSubscription(user);
       if (!subscription || Number(subscription.planId) === 0) return null;
 
-      const planMonthlyCap = Number(subscription.plan?.monthlyCap ?? 0);
+      const planMonthlyCap = subscriptionEffectiveCap(subscription);
       const planId = Number(subscription.planId);
       const used = Number(subscription.usedThisWindow ?? 0);
       const isPriceAccuracyMode = normalizedMode === 'price_accuracy' || normalizedMode === 'full';
-      const effectiveCap = isPriceAccuracyMode ? Number(oracle.GLOBAL_PRICE_ACCURACY_CAP) : planMonthlyCap;
+      const effectiveCap = isPriceAccuracyMode ? Math.min(Number(oracle.GLOBAL_PRICE_ACCURACY_CAP), planMonthlyCap) : planMonthlyCap;
 
       let remainingValue = remainingOverride;
       if (remainingValue !== undefined && remainingValue !== null) {
@@ -2153,6 +2160,42 @@ async function getPendingSubscriptionUsage(address) {
   }
 }
 
+// Tiny per-process TTL caches to avoid duplicate lookups during bursts
+const PENDING_CACHE_TTL_MS = 1_000;
+const pendingUsageCache = new Map();
+const pendingCreditsCache = new Map();
+const pendingEngagementCache = new Map();
+const pendingCalculatedCache = new Map();
+
+function getCachedValue(cache, key, loader, ttl = PENDING_CACHE_TTL_MS) {
+  const existing = cache.get(key);
+  if (existing) {
+    const age = Date.now() - existing.ts;
+    if (age < ttl) return existing.value;
+    // If a promise is still in-flight, reuse it
+    if (existing.value && typeof existing.value.then === 'function') {
+      return existing.value;
+    }
+  }
+  const promise = Promise.resolve()
+    .then(loader)
+    .then(val => {
+      cache.set(key, { ts: Date.now(), value: val });
+      return val;
+    })
+    .catch(err => {
+      cache.delete(key);
+      throw err;
+    });
+  cache.set(key, { ts: Date.now(), value: promise });
+  return promise;
+}
+
+function pendingUsageCacheKey(user, subscription) {
+  const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
+  return `${user.toLowerCase()}|${planId}`;
+}
+
 async function cacheCreditAuthorization({ user, cost, contextHash, reason }) {
   if (!creditUsageStore) return;
   const numericCost = Number(cost);
@@ -2221,10 +2264,10 @@ async function cacheAuthorizationUsage({
       baseline = Number(stored.remaining);
     } else {
       // Plan changed or cache miss: fetch from on-chain first
-      const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
+      const planMonthlyCap = subscriptionEffectiveCap(subscription);
       
       if (planChanged && planMonthlyCap > 0) {
-        // Plan changed: reset to new plan's full cap
+        // Plan changed: reset to new plan's full cap (base + rollover already computed)
         baseline = planMonthlyCap;
       } else {
         // Cache miss: fetch actual on-chain state (includes window reset logic)
@@ -2286,7 +2329,7 @@ async function cacheAuthorizationUsage({
     console.log(`[cacheAuthorizationUsage] Final remaining after deduction: ${finalRemaining} for ${user}, quantity=${quantityNum}`);
 
     let earnedCreditsDelta = 0;
-    const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
+    const planMonthlyCap = subscriptionEffectiveCap(subscription);
     if (planMonthlyCap > 0) {
       // Use the actual baseline that was used (cached if available, otherwise calculated)
       const actualBaseline = (stored && stored.remaining !== undefined && stored.remaining !== null && planMatches) 
@@ -2362,65 +2405,56 @@ app.post('/inference/authorize', async (req, res) => {
       return null;
     });
 
-    const pendingUsagePromise = (async () => {
-      try {
-        const subscription = await subscriptionPromise;
-        if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
-          const normalizedAddress = normalizeAddress(checksumUser);
-          // For subscription-based inference, all modes share the same pool, so always check 'general' mode
-          const cacheLookupMode = 'general';
-          const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
+    const pendingUsagePromise = subscriptionPromise.then(subscription =>
+      getCachedValue(
+        pendingUsageCache,
+        pendingUsageCacheKey(checksumUser, subscription),
+        async () => {
+          if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
+            const normalizedAddress = normalizeAddress(checksumUser);
+            const cacheLookupMode = 'general';
+            const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
 
-          // Only use Neo4j pending usage if planId matches (cache is for current plan)
-          const currentPlanId = Number(subscription.planId);
-          const cachedPlanId = stored?.planId;
-          if (stored && stored.remaining !== undefined && stored.remaining !== null &&
-              cachedPlanId !== null && cachedPlanId === currentPlanId) {
-            const monthlyCap = Number(subscription.plan.monthlyCap);
-            const onChainUsed = Number(subscription.usedThisWindow);
-            const remainingFromNeo4j = Number(stored.remaining);
-            // Calculate pending: total used (from remaining) - on-chain settled usage
-            // remaining = monthlyCap - totalUsed, so totalUsed = monthlyCap - remaining
-            const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
-            return Math.max(0, totalUsedFromNeo4j - onChainUsed);
+            const currentPlanId = Number(subscription.planId);
+            const cachedPlanId = stored?.planId;
+            if (stored && stored.remaining !== undefined && stored.remaining !== null &&
+                cachedPlanId !== null && cachedPlanId === currentPlanId) {
+              const monthlyCap = subscriptionEffectiveCap(subscription);
+              const onChainUsed = Number(subscription.usedThisWindow);
+              const remainingFromNeo4j = Number(stored.remaining);
+              const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
+              return Math.max(0, totalUsedFromNeo4j - onChainUsed);
+            }
           }
+          return 0;
         }
-      } catch (err) {
-        console.error('[authorize] Error calculating pending usage from Neo4j:', err.message || err);
-      }
-      return 0;
-    })();
+      )
+    );
 
-    const pendingCreditsPromise = (async () => {
-      try {
-        return await getPendingCreditUsage(checksumUser);
-      } catch (err) {
-        console.error('[authorize] Error calculating pending credits from Neo4j:', err.message || err);
-        return 0;
-      }
-    })();
+    const pendingCreditsPromise = getCachedValue(
+      pendingCreditsCache,
+      checksumUser.toLowerCase(),
+      () => getPendingCreditUsage(checksumUser)
+    );
 
-    const pendingEngagementPromise = (async () => {
-      try {
-        return await getPendingEngagementCredits(checksumUser);
-      } catch (err) {
-        console.error('[authorize] Error calculating pending engagement credits from Neo4j:', err.message || err);
-        return 0;
-      }
-    })();
+    const pendingEngagementPromise = getCachedValue(
+      pendingEngagementCache,
+      checksumUser.toLowerCase(),
+      () => getPendingEngagementCredits(checksumUser)
+    );
 
-    const pendingCalculatedPromise = (async () => {
-      try {
+    const pendingCalculatedPromise = getCachedValue(
+      pendingCalculatedCache,
+      checksumUser.toLowerCase(),
+      async () => {
         if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
           const normalizedAddress = normalizeAddress(checksumUser);
           const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
           return Number(calculated?.totalCalculatedCredits || 0);
         }
-      } catch (err) {
-        console.error('[authorize] Error calculating pending calculated credits from Neo4j:', err.message || err);
+        return 0;
       }
-      return 0;
-    })();
+    );
 
     const [
       _subscriptionUnused,
@@ -2486,65 +2520,56 @@ app.post('/inference/record', async (req, res) => {
       return null;
     });
 
-    const pendingUsagePromise = (async () => {
-      try {
-        const subscription = await subscriptionPromise;
-        if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
-          const normalizedAddress = normalizeAddress(checksumUser);
-          // For subscription-based inference, all modes share the same pool, so always check 'general' mode
-          const cacheLookupMode = 'general';
-          const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
+    const pendingUsagePromise = subscriptionPromise.then(subscription =>
+      getCachedValue(
+        pendingUsageCache,
+        pendingUsageCacheKey(checksumUser, subscription),
+        async () => {
+          if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
+            const normalizedAddress = normalizeAddress(checksumUser);
+            const cacheLookupMode = 'general';
+            const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
 
-          // Only use Neo4j pending usage if planId matches (cache is for current plan)
-          const currentPlanId = Number(subscription.planId);
-          const cachedPlanId = stored?.planId;
-          if (stored && stored.remaining !== undefined && stored.remaining !== null &&
-              cachedPlanId !== null && cachedPlanId === currentPlanId) {
-            const monthlyCap = Number(subscription.plan.monthlyCap);
-            const onChainUsed = Number(subscription.usedThisWindow);
-            const remainingFromNeo4j = Number(stored.remaining);
-            // Calculate pending: total used (from remaining) - on-chain settled usage
-            // remaining = monthlyCap - totalUsed, so totalUsed = monthlyCap - remaining
-            const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
-            return Math.max(0, totalUsedFromNeo4j - onChainUsed);
+            const currentPlanId = Number(subscription.planId);
+            const cachedPlanId = stored?.planId;
+            if (stored && stored.remaining !== undefined && stored.remaining !== null &&
+                cachedPlanId !== null && cachedPlanId === currentPlanId) {
+              const monthlyCap = subscriptionEffectiveCap(subscription);
+              const onChainUsed = Number(subscription.usedThisWindow);
+              const remainingFromNeo4j = Number(stored.remaining);
+              const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
+              return Math.max(0, totalUsedFromNeo4j - onChainUsed);
+            }
           }
+          return 0;
         }
-      } catch (err) {
-        console.error('[record] Error calculating pending usage from Neo4j:', err.message || err);
-      }
-      return 0;
-    })();
+      )
+    );
 
-    const pendingCreditsPromise = (async () => {
-      try {
-        return await getPendingCreditUsage(checksumUser);
-      } catch (err) {
-        console.error('[record] Error calculating pending credits from Neo4j:', err.message || err);
-        return 0;
-      }
-    })();
+    const pendingCreditsPromise = getCachedValue(
+      pendingCreditsCache,
+      checksumUser.toLowerCase(),
+      () => getPendingCreditUsage(checksumUser)
+    );
 
-    const pendingEngagementPromise = (async () => {
-      try {
-        return await getPendingEngagementCredits(checksumUser);
-      } catch (err) {
-        console.error('[record] Error calculating pending engagement credits from Neo4j:', err.message || err);
-        return 0;
-      }
-    })();
+    const pendingEngagementPromise = getCachedValue(
+      pendingEngagementCache,
+      checksumUser.toLowerCase(),
+      () => getPendingEngagementCredits(checksumUser)
+    );
 
-    const pendingCalculatedPromise = (async () => {
-      try {
+    const pendingCalculatedPromise = getCachedValue(
+      pendingCalculatedCache,
+      checksumUser.toLowerCase(),
+      async () => {
         if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
           const normalizedAddress = normalizeAddress(checksumUser);
           const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
           return Number(calculated?.totalCalculatedCredits || 0);
         }
-      } catch (err) {
-        console.error('[record] Error calculating pending calculated credits from Neo4j:', err.message || err);
+        return 0;
       }
-      return 0;
-    })();
+    );
 
     const [
       _subscriptionUnused,
@@ -2836,7 +2861,7 @@ app.get('/users/:address/summary', async (req, res) => {
         }
       } else {
         // Plan changed, subscription renewed, or cache miss: fetch from on-chain first
-        const planMonthlyCap = Number(subscription?.plan?.monthlyCap ?? 0);
+        const planMonthlyCap = subscriptionEffectiveCap(subscription);
         let remaining = null;
         
         if (planChanged && planMonthlyCap > 0) {
