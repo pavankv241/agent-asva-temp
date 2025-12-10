@@ -2356,60 +2356,85 @@ app.post('/inference/authorize', async (req, res) => {
       resolvedMode = 'basic';
     }
 
-    // Calculate pending usage from Neo4j to prevent exceeding cap before settlement
-    // This ensures users can't exceed their monthly cap even if settlement happens hourly
-    let pendingUsageFromNeo4j = 0;
-    try {
-      const subscription = await getOracle().getUserSubscription(checksumUser);
-      if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
-        const normalizedAddress = normalizeAddress(checksumUser);
-        // For subscription-based inference, all modes share the same pool, so always check 'general' mode
-        const cacheLookupMode = 'general';
-        const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
-        
-        // Only use Neo4j pending usage if planId matches (cache is for current plan)
-        const currentPlanId = Number(subscription.planId);
-        const cachedPlanId = stored?.planId;
-        if (stored && stored.remaining !== undefined && stored.remaining !== null &&
-            cachedPlanId !== null && cachedPlanId === currentPlanId) {
-          const monthlyCap = Number(subscription.plan.monthlyCap);
-          const onChainUsed = Number(subscription.usedThisWindow);
-          const remainingFromNeo4j = Number(stored.remaining);
-          // Calculate pending: total used (from remaining) - on-chain settled usage
-          // remaining = monthlyCap - totalUsed, so totalUsed = monthlyCap - remaining
-          const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
-          pendingUsageFromNeo4j = Math.max(0, totalUsedFromNeo4j - onChainUsed);
+    // Kick off all the expensive lookups in parallel to reduce latency
+    const subscriptionPromise = getOracle().getUserSubscription(checksumUser).catch(err => {
+      console.error('[authorize] Error fetching subscription:', err.message || err);
+      return null;
+    });
+
+    const pendingUsagePromise = (async () => {
+      try {
+        const subscription = await subscriptionPromise;
+        if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
+          const normalizedAddress = normalizeAddress(checksumUser);
+          // For subscription-based inference, all modes share the same pool, so always check 'general' mode
+          const cacheLookupMode = 'general';
+          const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
+
+          // Only use Neo4j pending usage if planId matches (cache is for current plan)
+          const currentPlanId = Number(subscription.planId);
+          const cachedPlanId = stored?.planId;
+          if (stored && stored.remaining !== undefined && stored.remaining !== null &&
+              cachedPlanId !== null && cachedPlanId === currentPlanId) {
+            const monthlyCap = Number(subscription.plan.monthlyCap);
+            const onChainUsed = Number(subscription.usedThisWindow);
+            const remainingFromNeo4j = Number(stored.remaining);
+            // Calculate pending: total used (from remaining) - on-chain settled usage
+            // remaining = monthlyCap - totalUsed, so totalUsed = monthlyCap - remaining
+            const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
+            return Math.max(0, totalUsedFromNeo4j - onChainUsed);
+          }
         }
+      } catch (err) {
+        console.error('[authorize] Error calculating pending usage from Neo4j:', err.message || err);
       }
-    } catch (err) {
-      console.error('[authorize] Error calculating pending usage from Neo4j:', err.message || err);
-      // Continue with on-chain check only if Neo4j fails
-    }
+      return 0;
+    })();
 
-    let pendingCreditsFromNeo4j = 0;
-    try {
-      pendingCreditsFromNeo4j = await getPendingCreditUsage(checksumUser);
-    } catch (err) {
-      console.error('[authorize] Error calculating pending credits from Neo4j:', err.message || err);
-    }
-
-    let pendingEngagementFromNeo4j = 0;
-    try {
-      pendingEngagementFromNeo4j = await getPendingEngagementCredits(checksumUser);
-    } catch (err) {
-      console.error('[authorize] Error calculating pending engagement credits from Neo4j:', err.message || err);
-    }
-
-    let pendingCalculatedFromNeo4j = 0;
-    try {
-      if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
-        const normalizedAddress = normalizeAddress(checksumUser);
-        const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
-        pendingCalculatedFromNeo4j = Number(calculated?.totalCalculatedCredits || 0);
+    const pendingCreditsPromise = (async () => {
+      try {
+        return await getPendingCreditUsage(checksumUser);
+      } catch (err) {
+        console.error('[authorize] Error calculating pending credits from Neo4j:', err.message || err);
+        return 0;
       }
-    } catch (err) {
-      console.error('[authorize] Error calculating pending calculated credits from Neo4j:', err.message || err);
-    }
+    })();
+
+    const pendingEngagementPromise = (async () => {
+      try {
+        return await getPendingEngagementCredits(checksumUser);
+      } catch (err) {
+        console.error('[authorize] Error calculating pending engagement credits from Neo4j:', err.message || err);
+        return 0;
+      }
+    })();
+
+    const pendingCalculatedPromise = (async () => {
+      try {
+        if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
+          const normalizedAddress = normalizeAddress(checksumUser);
+          const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
+          return Number(calculated?.totalCalculatedCredits || 0);
+        }
+      } catch (err) {
+        console.error('[authorize] Error calculating pending calculated credits from Neo4j:', err.message || err);
+      }
+      return 0;
+    })();
+
+    const [
+      _subscriptionUnused,
+      pendingUsageFromNeo4j,
+      pendingCreditsFromNeo4j,
+      pendingEngagementFromNeo4j,
+      pendingCalculatedFromNeo4j
+    ] = await Promise.all([
+      subscriptionPromise,
+      pendingUsagePromise,
+      pendingCreditsPromise,
+      pendingEngagementPromise,
+      pendingCalculatedPromise
+    ]);
 
     const result = await getOracle().authorizeInference(
       user,
@@ -2455,60 +2480,85 @@ app.post('/inference/record', async (req, res) => {
       resolvedMode = 'basic';
     }
 
-    // Calculate pending usage from Neo4j to prevent exceeding cap before settlement
-    // This ensures users can't exceed their monthly cap even if settlement happens hourly
-    let pendingUsageFromNeo4j = 0;
-    try {
-      const subscription = await getOracle().getUserSubscription(checksumUser);
-      if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
-        const normalizedAddress = normalizeAddress(checksumUser);
-        // For subscription-based inference, all modes share the same pool, so always check 'general' mode
-        const cacheLookupMode = 'general';
-        const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
-        
-        // Only use Neo4j pending usage if planId matches (cache is for current plan)
-        const currentPlanId = Number(subscription.planId);
-        const cachedPlanId = stored?.planId;
-        if (stored && stored.remaining !== undefined && stored.remaining !== null &&
-            cachedPlanId !== null && cachedPlanId === currentPlanId) {
-          const monthlyCap = Number(subscription.plan.monthlyCap);
-          const onChainUsed = Number(subscription.usedThisWindow);
-          const remainingFromNeo4j = Number(stored.remaining);
-          // Calculate pending: total used (from remaining) - on-chain settled usage
-          // remaining = monthlyCap - totalUsed, so totalUsed = monthlyCap - remaining
-          const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
-          pendingUsageFromNeo4j = Math.max(0, totalUsedFromNeo4j - onChainUsed);
+    // Calculate all pending values in parallel to cut request latency
+    const subscriptionPromise = getOracle().getUserSubscription(checksumUser).catch(err => {
+      console.error('[record] Error fetching subscription:', err.message || err);
+      return null;
+    });
+
+    const pendingUsagePromise = (async () => {
+      try {
+        const subscription = await subscriptionPromise;
+        if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
+          const normalizedAddress = normalizeAddress(checksumUser);
+          // For subscription-based inference, all modes share the same pool, so always check 'general' mode
+          const cacheLookupMode = 'general';
+          const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
+
+          // Only use Neo4j pending usage if planId matches (cache is for current plan)
+          const currentPlanId = Number(subscription.planId);
+          const cachedPlanId = stored?.planId;
+          if (stored && stored.remaining !== undefined && stored.remaining !== null &&
+              cachedPlanId !== null && cachedPlanId === currentPlanId) {
+            const monthlyCap = Number(subscription.plan.monthlyCap);
+            const onChainUsed = Number(subscription.usedThisWindow);
+            const remainingFromNeo4j = Number(stored.remaining);
+            // Calculate pending: total used (from remaining) - on-chain settled usage
+            // remaining = monthlyCap - totalUsed, so totalUsed = monthlyCap - remaining
+            const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
+            return Math.max(0, totalUsedFromNeo4j - onChainUsed);
+          }
         }
+      } catch (err) {
+        console.error('[record] Error calculating pending usage from Neo4j:', err.message || err);
       }
-    } catch (err) {
-      console.error('[record] Error calculating pending usage from Neo4j:', err.message || err);
-      // Continue with on-chain check only if Neo4j fails
-    }
+      return 0;
+    })();
 
-    let pendingCreditsFromNeo4j = 0;
-    try {
-      pendingCreditsFromNeo4j = await getPendingCreditUsage(checksumUser);
-    } catch (err) {
-      console.error('[record] Error calculating pending credits from Neo4j:', err.message || err);
-    }
-
-    let pendingEngagementFromNeo4j = 0;
-    try {
-      pendingEngagementFromNeo4j = await getPendingEngagementCredits(checksumUser);
-    } catch (err) {
-      console.error('[record] Error calculating pending engagement credits from Neo4j:', err.message || err);
-    }
-
-    let pendingCalculatedFromNeo4j = 0;
-    try {
-      if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
-        const normalizedAddress = normalizeAddress(checksumUser);
-        const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
-        pendingCalculatedFromNeo4j = Number(calculated?.totalCalculatedCredits || 0);
+    const pendingCreditsPromise = (async () => {
+      try {
+        return await getPendingCreditUsage(checksumUser);
+      } catch (err) {
+        console.error('[record] Error calculating pending credits from Neo4j:', err.message || err);
+        return 0;
       }
-    } catch (err) {
-      console.error('[record] Error calculating pending calculated credits from Neo4j:', err.message || err);
-    }
+    })();
+
+    const pendingEngagementPromise = (async () => {
+      try {
+        return await getPendingEngagementCredits(checksumUser);
+      } catch (err) {
+        console.error('[record] Error calculating pending engagement credits from Neo4j:', err.message || err);
+        return 0;
+      }
+    })();
+
+    const pendingCalculatedPromise = (async () => {
+      try {
+        if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
+          const normalizedAddress = normalizeAddress(checksumUser);
+          const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
+          return Number(calculated?.totalCalculatedCredits || 0);
+        }
+      } catch (err) {
+        console.error('[record] Error calculating pending calculated credits from Neo4j:', err.message || err);
+      }
+      return 0;
+    })();
+
+    const [
+      _subscriptionUnused,
+      pendingUsageFromNeo4j,
+      pendingCreditsFromNeo4j,
+      pendingEngagementFromNeo4j,
+      pendingCalculatedFromNeo4j
+    ] = await Promise.all([
+      subscriptionPromise,
+      pendingUsagePromise,
+      pendingCreditsPromise,
+      pendingEngagementPromise,
+      pendingCalculatedPromise
+    ]);
 
     // Re-check authorization to prevent race conditions and determine billing method
     const result = await getOracle().authorizeInference(
