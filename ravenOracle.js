@@ -87,10 +87,12 @@ class RavenOracle {
         this._rateLimiter = new Map(); // user -> timestamps[] (ms)
         this._grantedInitial = new Set(); // process-local one-time credit grant guard
 
-        // Small, per-process read cache to shave latency on hot paths
-        this.CACHE_TTL_MS = 5_000;
+        // Small, per-process read cache and in-flight dedupe to shave latency
+        this.CACHE_TTL_MS = 2_000;
         this._subscriptionCache = new Map(); // address -> { value, ts }
         this._creditsCache = new Map(); // address -> { value, ts }
+        this._inflightSubscription = new Map(); // address -> Promise
+        this._inflightCredits = new Map(); // address -> Promise
 
         // Plans now gate only monthly caps; any user may request any supported mode.
     }
@@ -275,11 +277,10 @@ class RavenOracle {
 
         if (isSubscribed) {
             const monthlyCap = Number(subscription.plan.monthlyCap);
+            const rollover = Number(subscription.rolloverAllowance ?? 0);
+            const effectiveCap = monthlyCap + rollover;
             const used = Number(subscription.usedThisWindow);
             const pendingUsage = Number(pendingUsageFromNeo4j) || 0;
-            // Use per-plan monthlyCap for all modes (Plan1=3000, Plan2=4000, Plan3=5000)
-            // Include pending usage from Neo4j to prevent exceeding cap before settlement
-            const effectiveCap = monthlyCap;
             const totalUsed = used + pendingUsage;
             if (totalUsed + quantity <= effectiveCap) {
                 return { allowed: true, method: 'subscription', reason: 'within_subscription_cap', cost: 0 };
@@ -304,9 +305,13 @@ class RavenOracle {
         // 6) Fallback: if credits unavailable but subscription still has room (unlikely due to above), allow
         if (isSubscribed) {
             const monthlyCap = Number(subscription.plan.monthlyCap);
+            const rollover = Number(subscription.rolloverAllowance ?? 0);
+            const effectiveCapBase = monthlyCap + rollover;
             const used = Number(subscription.usedThisWindow);
             const pendingUsage = Number(pendingUsageFromNeo4j) || 0;
-            const effectiveCap = isPriceAccuracyMode ? this.GLOBAL_PRICE_ACCURACY_CAP : monthlyCap;
+            const effectiveCap = isPriceAccuracyMode
+                ? Math.min(effectiveCapBase, this.GLOBAL_PRICE_ACCURACY_CAP)
+                : effectiveCapBase;
             const totalUsed = used + pendingUsage;
             if (totalUsed + quantity <= effectiveCap) {
                 return { allowed: true, method: 'subscription', reason: 'fallback_subscription', cost: 0 };
@@ -346,56 +351,84 @@ class RavenOracle {
 
     // Get user subscription info from RavenAccess contract
     async getUserSubscription(userAddress) {
-        const cached = this._fromCache(this._subscriptionCache, userAddress);
+        const key = String(userAddress || '').toLowerCase();
+        const cached = this._fromCache(this._subscriptionCache, key);
         if (cached) return cached;
-        try {
-            // Prefer direct view helper on contract (single call for most fields)
-            const res = await this.ravenAccess.getUserSubscription(userAddress);
-            // res: (planId, startTs, usedThisWindow, lastRenewedAt, planMonthlyCap, planPriceUnits)
-            const planId = res.planId ?? res[0];
-            const startTimestamp = res.startTs ?? res[1];
-            const usedThisWindow = res.usedThisWindow ?? res[2];
-            const lastRenewedAt = res.lastRenewedAt ?? res[3];
-            const planMonthlyCap = res.planMonthlyCap ?? res[4];
-            const planPriceUnits = res.planPriceUnits ?? res[5];
 
-            // Fetch 'active' flag separately (not included in view helper)
-            let active = false;
-            if (Number(planId) > 0) {
-                const fullPlan = await this.ravenAccess.plans(planId);
-                active = Boolean(fullPlan.active);
-            }
+        const inflight = this._inflightSubscription.get(key);
+        if (inflight) return inflight;
 
-            return {
-                planId,
-                startTimestamp,
-                usedThisWindow,
-                lastRenewedAt,
-                plan: {
-                    priceUnits: planPriceUnits,
-                    monthlyCap: planMonthlyCap,
-                    active
+        const promise = (async () => {
+            try {
+                // Prefer direct view helper on contract (single call for most fields)
+                const res = await this.ravenAccess.getUserSubscription(userAddress);
+                // res: (planId, startTs, usedThisWindow, lastRenewedAt, planMonthlyCap, planPriceUnits, rolloverAllowance, windowEndsAt)
+                const planId = res.planId ?? res[0];
+                const startTimestamp = res.startTs ?? res[1];
+                const usedThisWindow = res.usedThisWindow ?? res[2];
+                const lastRenewedAt = res.lastRenewedAt ?? res[3];
+                const planMonthlyCap = res.planMonthlyCap ?? res[4];
+                const planPriceUnits = res.planPriceUnits ?? res[5];
+                const rolloverAllowance = res.rolloverAllowance ?? res[6];
+                const windowEndsAt = res.windowEndsAt ?? res[7];
+
+                // Fetch 'active' flag separately (not included in view helper)
+                let active = false;
+                if (Number(planId) > 0) {
+                    const fullPlan = await this.ravenAccess.plans(planId);
+                    active = Boolean(fullPlan.active);
                 }
-            };
-            return this._storeCache(this._subscriptionCache, userAddress, out);
-        } catch (error) {
-            console.error('Error getting user subscription:', error);
-            return null;
-        }
+
+                const out = {
+                    planId,
+                    startTimestamp,
+                    usedThisWindow,
+                    lastRenewedAt,
+                    plan: {
+                        priceUnits: planPriceUnits,
+                        monthlyCap: planMonthlyCap,
+                        active
+                    },
+                    rolloverAllowance,
+                    windowEndsAt
+                };
+                return this._storeCache(this._subscriptionCache, key, out);
+            } catch (error) {
+                console.error('Error getting user subscription:', error);
+                return null;
+            } finally {
+                this._inflightSubscription.delete(key);
+            }
+        })();
+
+        this._inflightSubscription.set(key, promise);
+        return promise;
     }
 
     // Get user current credits
     async getUserCredits(userAddress) {
-        const cached = this._fromCache(this._creditsCache, userAddress);
+        const key = String(userAddress || '').toLowerCase();
+        const cached = this._fromCache(this._creditsCache, key);
         if (cached) return cached;
-        try {
-            // Prefer direct view helper for credits
-            const credits = await this.ravenAccess.getUserCredits(userAddress);
-            return this._storeCache(this._creditsCache, userAddress, credits.toString());
-        } catch (error) {
-            console.error('Error getting user credits:', error);
-            return '0';
-        }
+
+        const inflight = this._inflightCredits.get(key);
+        if (inflight) return inflight;
+
+        const promise = (async () => {
+            try {
+                // Prefer direct view helper for credits
+                const credits = await this.ravenAccess.getUserCredits(userAddress);
+                return this._storeCache(this._creditsCache, key, credits.toString());
+            } catch (error) {
+                console.error('Error getting user credits:', error);
+                return '0';
+            } finally {
+                this._inflightCredits.delete(key);
+            }
+        })();
+
+        this._inflightCredits.set(key, promise);
+        return promise;
     }
 
     // Check if user has active subscription
@@ -593,30 +626,21 @@ class RavenOracle {
                 return '0';
             }
 
-            // Apply window reset logic (30-day windows, matching contract logic)
+            // Window reset logic: if window elapsed, remaining is 0 until refreshed on-chain
             let usedCount = Number(subscription.usedThisWindow);
-            if (subscription.startTimestamp && Number(subscription.startTimestamp) > 0) {
-                const DAYS_30_SECONDS = 30 * 24 * 60 * 60; // 2592000 seconds
-                const startTimestamp = Number(subscription.startTimestamp);
-                // Get current block timestamp (in seconds)
-                const currentBlock = await this.provider.getBlock('latest');
-                const currentTimestamp = currentBlock ? currentBlock.timestamp : Math.floor(Date.now() / 1000);
-                
-                // Match contract's _monthWindowStart logic: (timestamp / 30 days) * 30 days
-                const lastWindow = Math.floor(startTimestamp / DAYS_30_SECONDS) * DAYS_30_SECONDS;
-                const currentWindow = Math.floor(currentTimestamp / DAYS_30_SECONDS) * DAYS_30_SECONDS;
-                
-                if (currentWindow > lastWindow) {
-                    usedCount = 0; // Window reset
-                }
+            const windowEndsAt = Number(subscription.windowEndsAt || 0);
+            const rolloverAllowance = Number(subscription.rolloverAllowance || 0);
+
+            const currentBlock = await this.provider.getBlock('latest');
+            const currentTimestamp = currentBlock ? currentBlock.timestamp : Math.floor(Date.now() / 1000);
+
+            if (windowEndsAt > 0 && currentTimestamp > windowEndsAt) {
+                return '0';
             }
 
-            // Determine effective cap based on plan (Plan1=3000, Plan2=4000, Plan3=5000)
-            const normalizedMode = String(mode || '').toLowerCase();
             const planCap = Number(subscription.plan.monthlyCap);
-            const effectiveCap = planCap;
+            const effectiveCap = planCap + rolloverAllowance;
 
-            // Calculate remaining (prevent negative)
             if (usedCount >= effectiveCap) {
                 return '0';
             }
@@ -630,7 +654,7 @@ class RavenOracle {
     getAccessABI() {
         return [
             "function subscriptions(address user) external view returns (uint8 planId, uint256 startTimestamp, uint256 usedThisWindow, uint256 lastRenewedAt)",
-            "function getUserSubscription(address user) external view returns (uint8 planId, uint256 startTs, uint256 usedThisWindow, uint256 lastRenewedAt, uint256 planMonthlyCap, uint256 planPriceUnits)",
+            "function getUserSubscription(address user) external view returns (uint8 planId, uint256 startTs, uint256 usedThisWindow, uint256 lastRenewedAt, uint256 planMonthlyCap, uint256 planPriceUnits, uint256 rolloverAllowance, uint256 windowEndsAt)",
             "function plans(uint8 planId) external view returns (uint256 priceUnits, uint256 monthlyCap, bool active)",
             "function credits(address user) external view returns (uint256)",
             "function getUserCredits(address user) external view returns (uint256)",
