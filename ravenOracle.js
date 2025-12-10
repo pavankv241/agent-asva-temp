@@ -88,11 +88,13 @@ class RavenOracle {
         this._grantedInitial = new Set(); // process-local one-time credit grant guard
 
         // Small, per-process read cache and in-flight dedupe to shave latency
-        this.CACHE_TTL_MS = 2_000;
+        this.CACHE_TTL_MS = 5_000;
         this._subscriptionCache = new Map(); // address -> { value, ts }
         this._creditsCache = new Map(); // address -> { value, ts }
         this._inflightSubscription = new Map(); // address -> Promise
         this._inflightCredits = new Map(); // address -> Promise
+        this._userStateCache = new Map(); // address -> { subscription, credits, ts }
+        this._inflightUserState = new Map(); // address -> Promise
 
         // Plans now gate only monthly caps; any user may request any supported mode.
     }
@@ -110,6 +112,45 @@ class RavenOracle {
     _storeCache(map, key, value) {
         map.set(key, { value, ts: Date.now() });
         return value;
+    }
+
+    _fromUserStateCache(key) {
+        const entry = this._userStateCache.get(key);
+        if (!entry) return null;
+        if (Date.now() - entry.ts > this.CACHE_TTL_MS) {
+            this._userStateCache.delete(key);
+            return null;
+        }
+        return entry;
+    }
+
+    _storeUserStateCache(key, subscription, credits) {
+        this._userStateCache.set(key, { subscription, credits, ts: Date.now() });
+        return { subscription, credits };
+    }
+
+    async getUserState(userAddress) {
+        const key = String(userAddress || '').toLowerCase();
+        const cached = this._fromUserStateCache(key);
+        if (cached) return cached;
+
+        const inflight = this._inflightUserState.get(key);
+        if (inflight) return inflight;
+
+        const promise = (async () => {
+            try {
+                const [subscription, creditsStr] = await Promise.all([
+                    this.getUserSubscription(userAddress),
+                    this.getUserCredits(userAddress)
+                ]);
+                return this._storeUserStateCache(key, subscription, creditsStr);
+            } finally {
+                this._inflightUserState.delete(key);
+            }
+        })();
+
+        this._inflightUserState.set(key, promise);
+        return promise;
     }
 
     // Update user memory pointer on-chain (requires signer)
@@ -230,20 +271,17 @@ class RavenOracle {
             return { allowed: false, method: 'deny', reason: 'rate_limited', cost: 0 };
         }
 
-        // 2) Fetch on-chain state (parallel to reduce latency)
-        const [subscription, creditsStr] = await Promise.all([
-            this.getUserSubscription(userAddress),
-            this.getUserCredits(userAddress)
-        ]);
-        const credits = BigInt(creditsStr);
+        // 2) Fetch on-chain state (cached/deduped) for subscription + credits
+        const { subscription, credits } = await this.getUserState(userAddress);
+        const creditsBig = BigInt(credits);
         const pendingCreditDebits = BigInt(pendingCreditsFromNeo4j || 0);
         const pendingCalculated = BigInt(pendingCalculatedFromNeo4j || 0);
         const pendingEngagement = BigInt(pendingEngagementFromNeo4j || 0);
-        const grossCredits = credits + pendingCalculated + pendingEngagement;
+        const grossCredits = creditsBig + pendingCalculated + pendingEngagement;
         const effectiveCredits = grossCredits > pendingCreditDebits ? grossCredits - pendingCreditDebits : 0n;
 
         // 3) Initial one-time 50-credits allowance (process-local guard)
-        if (!this._grantedInitial.has(userAddress) && credits === 0n && (!subscription || subscription.planId === 0)) {
+        if (!this._grantedInitial.has(userAddress) && creditsBig === 0n && (!subscription || subscription.planId === 0)) {
             return { allowed: true, method: 'initial_grant', reason: 'initial_50_credits', cost: 0 };
         }
 
