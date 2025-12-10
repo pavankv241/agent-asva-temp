@@ -208,9 +208,11 @@ class RavenOracle {
             return { allowed: false, method: 'deny', reason: 'rate_limited', cost: 0 };
         }
 
-        // 2) Fetch on-chain state
-        const subscription = await this.getUserSubscription(userAddress);
-        const creditsStr = await this.getUserCredits(userAddress);
+        // 2) Fetch on-chain state (parallel to reduce latency)
+        const [subscription, creditsStr] = await Promise.all([
+            this.getUserSubscription(userAddress),
+            this.getUserCredits(userAddress)
+        ]);
         const credits = BigInt(creditsStr);
         const pendingCreditDebits = BigInt(pendingCreditsFromNeo4j || 0);
         const pendingCalculated = BigInt(pendingCalculatedFromNeo4j || 0);
