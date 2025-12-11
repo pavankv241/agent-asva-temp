@@ -2820,12 +2820,18 @@ app.get('/users/:address/summary', async (req, res) => {
 
     // If subscription is null or empty object, automatically fetch fresh data to catch recent purchases
     let finalSubscription = subscription;
+    let subscriptionJustPurchased = false;
     if (!subscription || (typeof subscription === 'object' && Object.keys(subscription).length === 0)) {
       // Subscription appears missing - automatically fetch fresh from chain to catch recent purchases
       try {
         // Clear cache and fetch fresh
         getOracle().invalidateSubscriptionCache(checksumAddr);
         finalSubscription = await getOracle().getUserSubscription(checksumAddr);
+        // If we now have a subscription after refresh, it was just purchased
+        const newPlanId = finalSubscription ? Number(finalSubscription.planId ?? finalSubscription[0] ?? 0) : 0;
+        if (newPlanId > 0 && finalSubscription?.plan?.active) {
+          subscriptionJustPurchased = true;
+        }
       } catch (err) {
         console.error('[summary] error fetching fresh subscription after empty result', err.message || err);
         finalSubscription = subscription; // Fall back to original
@@ -2853,7 +2859,7 @@ app.get('/users/:address/summary', async (req, res) => {
       // Prefer cached Neo4j remaining (kept in sync by authorizeInference)
       const stored = await getStoredRemainingInference(normalizedAddress, normalizedMode);
       
-      // Check if cached planId matches current planId, or if subscription was recently renewed
+      // Check if cached planId matches current planId, or if subscription was recently renewed/purchased
       const cachedPlanId = stored?.planId;
       const planMatches = cachedPlanId !== null && cachedPlanId === planId;
       const subscriptionRenewedRecently = finalSubscription?.lastRenewedAt 
@@ -2861,7 +2867,8 @@ app.get('/users/:address/summary', async (req, res) => {
         : false;
       
       const planChanged = cachedPlanId !== null && cachedPlanId !== planId;
-      const shouldRefresh = planChanged || subscriptionRenewedRecently;
+      // Also refresh if subscription was just purchased (went from no subscription to having one)
+      const shouldRefresh = planChanged || subscriptionRenewedRecently || subscriptionJustPurchased;
       
       // Only use cached value if it's valid and we don't need to refresh
       // Cache is the source of truth for remaining count (updated after each authorization)
@@ -2897,11 +2904,13 @@ app.get('/users/:address/summary', async (req, res) => {
         }
         
         // Safeguard: Never increase remaining count (it should only decrease or stay same)
-        // If we have a cached value, only update if new value is lower (more accurate)
+        // Exception: allow increase when subscription was just purchased/renewed or plan changed
+        // If we have a cached value, only update if new value is lower (more usage) or subscription was purchased/renewed
         if (stored && stored.remaining !== undefined && stored.remaining !== null) {
           const cachedRemaining = Number(stored.remaining);
-          // Only update if new value is lower (more usage) or if plan changed/renewed
-          if (remaining > cachedRemaining && !planChanged && !subscriptionRenewedRecently) {
+          // Allow increase if subscription was just purchased, plan changed, or recently renewed
+          // Otherwise, only update if new value is lower (more usage)
+          if (remaining > cachedRemaining && !planChanged && !subscriptionRenewedRecently && !subscriptionJustPurchased) {
             // Don't overwrite cache with a higher value - use cached value instead
             remaining = cachedRemaining;
             inference.source = stored.source || 'neo4j';
@@ -2914,7 +2923,7 @@ app.get('/users/:address/summary', async (req, res) => {
         inference.remaining = String(remaining);
         // Set source if not already set by safeguard logic above
         if (!inference.source) {
-          inference.source = planChanged ? 'plan_reset' : 'onchain';
+          inference.source = subscriptionJustPurchased ? 'subscription_purchased' : (planChanged ? 'plan_reset' : 'onchain');
         }
         
         // Update cache with fresh data for all modes (accounting for pending usage)
