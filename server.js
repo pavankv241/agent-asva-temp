@@ -2410,22 +2410,22 @@ app.post('/inference/authorize', async (req, res) => {
         pendingUsageCache,
         pendingUsageCacheKey(checksumUser, subscription),
         async () => {
-          if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
-            const normalizedAddress = normalizeAddress(checksumUser);
-            const cacheLookupMode = 'general';
-            const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
-
-            const currentPlanId = Number(subscription.planId);
-            const cachedPlanId = stored?.planId;
-            if (stored && stored.remaining !== undefined && stored.remaining !== null &&
-                cachedPlanId !== null && cachedPlanId === currentPlanId) {
+      if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
+        const normalizedAddress = normalizeAddress(checksumUser);
+        const cacheLookupMode = 'general';
+        const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
+        
+        const currentPlanId = Number(subscription.planId);
+        const cachedPlanId = stored?.planId;
+        if (stored && stored.remaining !== undefined && stored.remaining !== null &&
+            cachedPlanId !== null && cachedPlanId === currentPlanId) {
               const monthlyCap = subscriptionEffectiveCap(subscription);
-              const onChainUsed = Number(subscription.usedThisWindow);
-              const remainingFromNeo4j = Number(stored.remaining);
-              const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
+          const onChainUsed = Number(subscription.usedThisWindow);
+          const remainingFromNeo4j = Number(stored.remaining);
+          const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
               return Math.max(0, totalUsedFromNeo4j - onChainUsed);
-            }
-          }
+        }
+      }
           return 0;
         }
       )
@@ -2447,11 +2447,11 @@ app.post('/inference/authorize', async (req, res) => {
       pendingCalculatedCache,
       checksumUser.toLowerCase(),
       async () => {
-        if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
-          const normalizedAddress = normalizeAddress(checksumUser);
-          const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
+      if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
+        const normalizedAddress = normalizeAddress(checksumUser);
+        const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
           return Number(calculated?.totalCalculatedCredits || 0);
-        }
+      }
         return 0;
       }
     );
@@ -2525,22 +2525,22 @@ app.post('/inference/record', async (req, res) => {
         pendingUsageCache,
         pendingUsageCacheKey(checksumUser, subscription),
         async () => {
-          if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
-            const normalizedAddress = normalizeAddress(checksumUser);
-            const cacheLookupMode = 'general';
-            const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
-
-            const currentPlanId = Number(subscription.planId);
-            const cachedPlanId = stored?.planId;
-            if (stored && stored.remaining !== undefined && stored.remaining !== null &&
-                cachedPlanId !== null && cachedPlanId === currentPlanId) {
+      if (subscription && Number(subscription.planId) > 0 && subscription.plan?.active) {
+        const normalizedAddress = normalizeAddress(checksumUser);
+        const cacheLookupMode = 'general';
+        const stored = await getStoredRemainingInference(normalizedAddress, cacheLookupMode);
+        
+        const currentPlanId = Number(subscription.planId);
+        const cachedPlanId = stored?.planId;
+        if (stored && stored.remaining !== undefined && stored.remaining !== null &&
+            cachedPlanId !== null && cachedPlanId === currentPlanId) {
               const monthlyCap = subscriptionEffectiveCap(subscription);
-              const onChainUsed = Number(subscription.usedThisWindow);
-              const remainingFromNeo4j = Number(stored.remaining);
-              const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
+          const onChainUsed = Number(subscription.usedThisWindow);
+          const remainingFromNeo4j = Number(stored.remaining);
+          const totalUsedFromNeo4j = monthlyCap - remainingFromNeo4j;
               return Math.max(0, totalUsedFromNeo4j - onChainUsed);
-            }
-          }
+        }
+      }
           return 0;
         }
       )
@@ -2562,11 +2562,11 @@ app.post('/inference/record', async (req, res) => {
       pendingCalculatedCache,
       checksumUser.toLowerCase(),
       async () => {
-        if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
-          const normalizedAddress = normalizeAddress(checksumUser);
-          const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
+      if (engagementStore && engagementStore.getCalculatedCreditsForUser) {
+        const normalizedAddress = normalizeAddress(checksumUser);
+        const calculated = await engagementStore.getCalculatedCreditsForUser(normalizedAddress);
           return Number(calculated?.totalCalculatedCredits || 0);
-        }
+      }
         return 0;
       }
     );
@@ -2927,6 +2927,7 @@ app.get('/users/:address/summary', async (req, res) => {
       }
     }
 
+    // Calculate pending values for response (credits are separate from inference)
     const pendingCalculatedCredits = Number(pendingCalculated) || 0;
     let pendingCreditDebits = 0;
     try {
