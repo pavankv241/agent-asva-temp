@@ -454,6 +454,12 @@ class RavenOracle {
                     rolloverAllowance,
                     windowEndsAt
             };
+                
+            // Log when we fetch fresh subscription data
+            if (Number(planId) > 0) {
+                console.log(`[getUserSubscription] Fetched fresh subscription: planId=${planId}, active=${active} for ${userAddress}`);
+            }
+                
                 return this._storeCache(this._subscriptionCache, key, out);
         } catch (error) {
             console.error('Error getting user subscription:', error);
