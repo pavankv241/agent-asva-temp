@@ -114,6 +114,16 @@ class RavenOracle {
         return value;
     }
 
+    // Invalidate subscription cache for a specific user (useful after purchase/renewal)
+    invalidateSubscriptionCache(userAddress) {
+        const key = String(userAddress || '').toLowerCase();
+        this._subscriptionCache.delete(key);
+        this._inflightSubscription.delete(key);
+        // Also clear from combined user state cache
+        this._userStateCache.delete(key);
+        this._inflightUserState.delete(key);
+    }
+
     _fromUserStateCache(key) {
         const entry = this._userStateCache.get(key);
         if (!entry) return null;
@@ -388,55 +398,69 @@ class RavenOracle {
     }
 
     // Get user subscription info from RavenAccess contract
+    // Automatically fetches fresh data when subscription is missing to catch recent purchases
     async getUserSubscription(userAddress) {
         const key = String(userAddress || '').toLowerCase();
+        
         const cached = this._fromCache(this._subscriptionCache, key);
-        if (cached) return cached;
+        // Always fetch fresh data if cached shows no subscription (to catch recent purchases immediately)
+        if (cached) {
+            const cachedPlanId = cached.planId ?? cached[0] ?? 0;
+            // If cached shows no subscription, always bypass cache and fetch fresh from chain
+            // This ensures we catch purchases immediately without waiting for cache expiry
+            if (Number(cachedPlanId) === 0) {
+                // Clear cache to force fresh fetch
+                this._subscriptionCache.delete(key);
+            } else {
+                // Has subscription, use normal cache
+                return cached;
+            }
+        }
 
         const inflight = this._inflightSubscription.get(key);
         if (inflight) return inflight;
 
         const promise = (async () => {
-            try {
-                // Prefer direct view helper on contract (single call for most fields)
-                const res = await this.ravenAccess.getUserSubscription(userAddress);
+        try {
+            // Prefer direct view helper on contract (single call for most fields)
+            const res = await this.ravenAccess.getUserSubscription(userAddress);
                 // res: (planId, startTs, usedThisWindow, lastRenewedAt, planMonthlyCap, planPriceUnits, rolloverAllowance, windowEndsAt)
-                const planId = res.planId ?? res[0];
-                const startTimestamp = res.startTs ?? res[1];
-                const usedThisWindow = res.usedThisWindow ?? res[2];
-                const lastRenewedAt = res.lastRenewedAt ?? res[3];
-                const planMonthlyCap = res.planMonthlyCap ?? res[4];
-                const planPriceUnits = res.planPriceUnits ?? res[5];
+            const planId = res.planId ?? res[0];
+            const startTimestamp = res.startTs ?? res[1];
+            const usedThisWindow = res.usedThisWindow ?? res[2];
+            const lastRenewedAt = res.lastRenewedAt ?? res[3];
+            const planMonthlyCap = res.planMonthlyCap ?? res[4];
+            const planPriceUnits = res.planPriceUnits ?? res[5];
                 const rolloverAllowance = res.rolloverAllowance ?? res[6];
                 const windowEndsAt = res.windowEndsAt ?? res[7];
 
-                // Fetch 'active' flag separately (not included in view helper)
-                let active = false;
-                if (Number(planId) > 0) {
-                    const fullPlan = await this.ravenAccess.plans(planId);
-                    active = Boolean(fullPlan.active);
-                }
+            // Fetch 'active' flag separately (not included in view helper)
+            let active = false;
+            if (Number(planId) > 0) {
+                const fullPlan = await this.ravenAccess.plans(planId);
+                active = Boolean(fullPlan.active);
+            }
 
                 const out = {
-                    planId,
-                    startTimestamp,
-                    usedThisWindow,
-                    lastRenewedAt,
-                    plan: {
-                        priceUnits: planPriceUnits,
-                        monthlyCap: planMonthlyCap,
-                        active
+                planId,
+                startTimestamp,
+                usedThisWindow,
+                lastRenewedAt,
+                plan: {
+                    priceUnits: planPriceUnits,
+                    monthlyCap: planMonthlyCap,
+                    active
                     },
                     rolloverAllowance,
                     windowEndsAt
-                };
+            };
                 return this._storeCache(this._subscriptionCache, key, out);
-            } catch (error) {
-                console.error('Error getting user subscription:', error);
-                return null;
+        } catch (error) {
+            console.error('Error getting user subscription:', error);
+            return null;
             } finally {
                 this._inflightSubscription.delete(key);
-            }
+        }
         })();
 
         this._inflightSubscription.set(key, promise);
@@ -453,16 +477,16 @@ class RavenOracle {
         if (inflight) return inflight;
 
         const promise = (async () => {
-            try {
-                // Prefer direct view helper for credits
-                const credits = await this.ravenAccess.getUserCredits(userAddress);
+        try {
+            // Prefer direct view helper for credits
+            const credits = await this.ravenAccess.getUserCredits(userAddress);
                 return this._storeCache(this._creditsCache, key, credits.toString());
-            } catch (error) {
-                console.error('Error getting user credits:', error);
-                return '0';
+        } catch (error) {
+            console.error('Error getting user credits:', error);
+            return '0';
             } finally {
                 this._inflightCredits.delete(key);
-            }
+        }
         })();
 
         this._inflightCredits.set(key, promise);
@@ -669,9 +693,9 @@ class RavenOracle {
             const windowEndsAt = Number(subscription.windowEndsAt || 0);
             const rolloverAllowance = Number(subscription.rolloverAllowance || 0);
 
-            const currentBlock = await this.provider.getBlock('latest');
-            const currentTimestamp = currentBlock ? currentBlock.timestamp : Math.floor(Date.now() / 1000);
-
+                const currentBlock = await this.provider.getBlock('latest');
+                const currentTimestamp = currentBlock ? currentBlock.timestamp : Math.floor(Date.now() / 1000);
+                
             if (windowEndsAt > 0 && currentTimestamp > windowEndsAt) {
                 return '0';
             }
