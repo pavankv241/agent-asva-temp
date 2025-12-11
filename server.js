@@ -2818,19 +2818,33 @@ app.get('/users/:address/summary', async (req, res) => {
       getPendingEngagementCredits(checksumAddr)
     ]);
 
-    // If subscription is null or empty object, automatically fetch fresh data to catch recent purchases
+    // Check if subscription is effectively empty (no active plan)
+    // This includes: null, empty object, or planId === 0
+    const currentPlanId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
+    const hasCurrentActiveSub = !!subscription && currentPlanId > 0 && subscription.plan?.active;
+    // Check for empty subscription: null, empty object {}, or planId === 0
+    const isEmptySubscription = !subscription || 
+                                 (typeof subscription === 'object' && Object.keys(subscription).length === 0) ||
+                                 currentPlanId === 0;
+    
+    // If subscription is empty or inactive, automatically fetch fresh data to catch recent purchases
     let finalSubscription = subscription;
     let subscriptionJustPurchased = false;
-    if (!subscription || (typeof subscription === 'object' && Object.keys(subscription).length === 0)) {
-      // Subscription appears missing - automatically fetch fresh from chain to catch recent purchases
+    if (isEmptySubscription) {
+      // Subscription appears missing/inactive - automatically fetch fresh from chain to catch recent purchases
+      console.log(`[summary] Empty subscription detected for ${checksumAddr}, fetching fresh data...`);
       try {
         // Clear cache and fetch fresh
         getOracle().invalidateSubscriptionCache(checksumAddr);
         finalSubscription = await getOracle().getUserSubscription(checksumAddr);
         // If we now have a subscription after refresh, it was just purchased
         const newPlanId = finalSubscription ? Number(finalSubscription.planId ?? finalSubscription[0] ?? 0) : 0;
-        if (newPlanId > 0 && finalSubscription?.plan?.active) {
+        const newHasActiveSub = !!finalSubscription && newPlanId > 0 && finalSubscription.plan?.active;
+        if (newHasActiveSub) {
           subscriptionJustPurchased = true;
+          console.log(`[summary] ✓ Detected subscription purchase: planId=${newPlanId} for ${checksumAddr}`);
+        } else {
+          console.log(`[summary] Still no active subscription after refresh: planId=${newPlanId} for ${checksumAddr}`);
         }
       } catch (err) {
         console.error('[summary] error fetching fresh subscription after empty result', err.message || err);
