@@ -2794,6 +2794,7 @@ app.get('/users/:address/subscription', async (req, res) => {
 });
 
 // Combined summary: subscription, credits, and remaining inference (auto mode)
+// Automatically fetches fresh subscription data when missing to catch recent purchases
 app.get('/users/:address/summary', async (req, res) => {
   try {
     const addr = req.params.address;
@@ -2817,8 +2818,22 @@ app.get('/users/:address/summary', async (req, res) => {
       getPendingEngagementCredits(checksumAddr)
     ]);
 
-    const planId = subscription ? Number(subscription.planId ?? subscription[0] ?? 0) : 0;
-    const hasActiveSub = !!subscription && planId > 0 && subscription.plan?.active;
+    // If subscription is null or empty object, automatically fetch fresh data to catch recent purchases
+    let finalSubscription = subscription;
+    if (!subscription || (typeof subscription === 'object' && Object.keys(subscription).length === 0)) {
+      // Subscription appears missing - automatically fetch fresh from chain to catch recent purchases
+      try {
+        // Clear cache and fetch fresh
+        getOracle().invalidateSubscriptionCache(checksumAddr);
+        finalSubscription = await getOracle().getUserSubscription(checksumAddr);
+      } catch (err) {
+        console.error('[summary] error fetching fresh subscription after empty result', err.message || err);
+        finalSubscription = subscription; // Fall back to original
+      }
+    }
+    
+    const planId = finalSubscription ? Number(finalSubscription.planId ?? finalSubscription[0] ?? 0) : 0;
+    const hasActiveSub = !!finalSubscription && planId > 0 && finalSubscription.plan?.active;
 
     // Use 'general' as default mode since all modes share the same subscription pool
     const checkMode = 'general';
@@ -2841,8 +2856,8 @@ app.get('/users/:address/summary', async (req, res) => {
       // Check if cached planId matches current planId, or if subscription was recently renewed
       const cachedPlanId = stored?.planId;
       const planMatches = cachedPlanId !== null && cachedPlanId === planId;
-      const subscriptionRenewedRecently = subscription?.lastRenewedAt 
-        ? (Date.now() / 1000 - Number(subscription.lastRenewedAt)) < 300 // Within last 5 minutes
+      const subscriptionRenewedRecently = finalSubscription?.lastRenewedAt 
+        ? (Date.now() / 1000 - Number(finalSubscription.lastRenewedAt)) < 300 // Within last 5 minutes
         : false;
       
       const planChanged = cachedPlanId !== null && cachedPlanId !== planId;
@@ -2861,7 +2876,7 @@ app.get('/users/:address/summary', async (req, res) => {
         }
       } else {
         // Plan changed, subscription renewed, or cache miss: fetch from on-chain first
-        const planMonthlyCap = subscriptionEffectiveCap(subscription);
+        const planMonthlyCap = subscriptionEffectiveCap(finalSubscription);
         let remaining = null;
         
         if (planChanged && planMonthlyCap > 0) {
@@ -2878,7 +2893,7 @@ app.get('/users/:address/summary', async (req, res) => {
         
         // Fallback to planMonthlyCap only if on-chain fetch failed
         if (!Number.isFinite(remaining) || remaining < 0) {
-          remaining = planMonthlyCap;
+          remaining = subscriptionEffectiveCap(finalSubscription);
         }
         
         // Safeguard: Never increase remaining count (it should only decrease or stay same)
@@ -2946,7 +2961,7 @@ app.get('/users/:address/summary', async (req, res) => {
 
     return res.json(serialize({
       address: checksumAddr,
-      subscription: subscription || {},
+      subscription: finalSubscription || {},
       credits,
       pendingCalculatedCredits: pendingCalculatedCredits.toString(),
       pendingCreditDebits: pendingCreditDebits.toString(),
